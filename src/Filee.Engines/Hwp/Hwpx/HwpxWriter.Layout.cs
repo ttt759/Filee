@@ -85,7 +85,7 @@ internal sealed partial class HwpxWriter
                 switch (inline)
                 {
                     case HText text:
-                        current += TextWidth(text.Text, text.Format.Size ?? size);
+                        current += EstimateRunWidth(text, text.Format.Size ?? size);
                         break;
                     case HTab:
                         current += 4000;
@@ -109,6 +109,27 @@ internal sealed partial class HwpxWriter
         Measure(paragraph.Inlines);
         lines += LinesFor(current, available);
         return lines * line + objects + (paragraph.Format.Before ?? 0) + (paragraph.Format.After ?? 0);
+    }
+
+    private static double EstimateRunWidth(HText run, int size)
+    {
+        // Plain Latin runs can use the advances of the named font. Other scripts may be drawn
+        // from different HWPX font slots, so keep their existing estimate.
+        var format = run.Format;
+        if (format.Font is not { } face || format.Bold == true || format.Italic == true
+            || format.Spacing is not (null or 0) || format.Superscript == true || format.Subscript == true
+            || !run.Text.All(c => c is >= ' ' and <= '~' or '\u00A0' or '\u2013' or '\u2014')
+            || RhwpFonts.Find(face) is not { Usable: true, Advance: { } advance })
+            return TextWidth(run.Text, size);
+
+        var width = 0.0;
+        foreach (var c in run.Text)
+        {
+            if (advance(c) is not { } ems)
+                return TextWidth(run.Text, size);
+            width += ems;
+        }
+        return width * size;
     }
 
     /// <summary>Wrapped lines for a text width; 5% slack so text that just fits is not pushed to a second line.</summary>
@@ -155,6 +176,10 @@ internal sealed partial class HwpxWriter
                         width += widths[i];
                     var needed = EstimateHeight(cell.Blocks.Count > 0 ? cell.Blocks : [new HParagraph()], Math.Max(1000, width - cellMargin.Left - cellMargin.Right))
                                  + cellMargin.Top + cellMargin.Bottom;
+                    // A collapsed Word table border is centered on the row edge. Each cell accounts for half
+                    // of its top and bottom strokes so a shared border does not add its full width twice.
+                    if (table.Rows[r].IncludeBordersInHeight && cell.Borders is { } borders)
+                        needed += (int)Math.Round((BorderWidth(borders.Top) + BorderWidth(borders.Bottom)) / 2);
                     var last = Math.Min(r + cell.RowSpan, heights.Length) - 1;
                     var have = 0;
                     for (var i = r; i <= last; i++)
@@ -166,6 +191,11 @@ internal sealed partial class HwpxWriter
         }
         _base = outerBase;
         return heights.Select(h => Math.Max(h, 282)).ToArray();
+
+        // Word line borders are at most 12 pt. Bound the layout contribution of malformed widths.
+        static double BorderWidth(HBorder border) => border.Style == HBorderStyle.None
+            ? 0
+            : Math.Clamp(border.WidthMm * HwpxUnits.PerMm, 0, 1200);
     }
 
     // ───────────────────────── Tabs ─────────────────────────

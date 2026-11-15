@@ -31,11 +31,13 @@ internal sealed partial class DocxReader
         // Borders and cell margins: table style chain, then the table's own properties.
         var borders = new Dictionary<string, HBorder>();
         HInsets? margins = null;
+        int? cellSpacing = null;
         foreach (var properties in styleChain.Select(s => s.TblPr).Append(tblPr))
         {
             ApplyBorders(properties?.Element(W + "tblBorders"), borders);
             if (properties?.Element(W + "tblCellMar") is { } cellMar)
                 margins = CellMargins(cellMar, margins);
+            cellSpacing = CellSpacing(properties) ?? cellSpacing;
         }
         table.CellMargin = margins;
         table.Borders = HBorders.Empty;
@@ -49,9 +51,14 @@ internal sealed partial class DocxReader
         {
             var tr = rows[r];
             var trPr = tr.Element(W + "trPr");
-            var row = new HRow { Header = trPr?.Element(W + "tblHeader") is { } header && Val(header) is not ("0" or "false") };
-            if (trPr?.Element(W + "trHeight") is { } height && Twips(height, "val") is > 0 and var h)
-                row.Height = HwpxUnits.FromTwips(h);
+            var height = trPr?.Element(W + "trHeight");
+            var rowSpacing = CellSpacing(trPr) ?? CellSpacing(tr.Element(W + "tblPrEx")) ?? cellSpacing;
+            var row = new HRow
+            {
+                Header = trPr?.Element(W + "tblHeader") is { } header && Val(header) is not ("0" or "false"),
+                Height = Twips(height, "val") is > 0 and var h ? HwpxUnits.FromTwips(h) : null,
+                IncludeBordersInHeight = rowSpacing is not > 0 && Attr(height, "hRule") != "exact",
+            };
 
             var column = Twips(trPr?.Element(W + "gridBefore"), "val") ?? 0;
             foreach (var tc in tr.Elements().SelectMany(e => e.Name == W + "tc" ? [e] : FlattenCells(e)))
@@ -134,6 +141,8 @@ internal sealed partial class DocxReader
             table.ColumnCount = Math.Max(table.ColumnCount, column);
         }
         return table;
+
+        static int? CellSpacing(XElement? properties) => Twips(properties?.Element(W + "tblCellSpacing"), "w");
     }
 
     /// <summary>

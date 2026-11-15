@@ -156,6 +156,9 @@ internal sealed class HRow
     /// <summary>Minimum row height; null = fit content.</summary>
     public int? Height { get; set; }
 
+    /// <summary>Reserve space for collapsed horizontal borders when estimating this Word row's height.</summary>
+    public bool IncludeBordersInHeight { get; init; }
+
     public bool Header { get; set; }
 }
 

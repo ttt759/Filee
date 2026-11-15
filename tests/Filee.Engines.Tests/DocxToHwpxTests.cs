@@ -194,6 +194,97 @@ public class DocxToHwpxTests(EngineFixture fx) : IClassFixture<EngineFixture>
     }
 
     [Fact]
+    public async Task Bordered_word_table_rows_reserve_their_share_of_each_horizontal_border()
+    {
+        static string Table(string style, int eighths, string tableProperties = "", string rowProperties = "")
+        {
+            var cell = $"<w:tc>{P(R("Row text"))}</w:tc>";
+            var row = $"<w:tr><w:trPr>{rowProperties}</w:trPr>{cell}</w:tr>";
+            return $"<w:tbl><w:tblPr>{tableProperties}{HorizontalBorders(style, eighths)}</w:tblPr>" +
+                   $"<w:tblGrid><w:gridCol w:w=\"3000\"/></w:tblGrid>{row}{row}</w:tbl>";
+        }
+
+        const string fixedHeight = """<w:trHeight w:val="20" w:hRule="exact"/>""";
+        var docx = new DocxBuilder()
+            .Paragraph(Table("nil", 8))
+            .Paragraph(Table("single", 4))
+            .Paragraph(Table("single", 8))
+            .Paragraph(Table("single", 8, """<w:tblCellSpacing w:w="20" w:type="dxa"/>"""))
+            .Paragraph(Table("nil", 8, rowProperties: fixedHeight))
+            .Paragraph(Table("single", 8, rowProperties: fixedHeight))
+            .Paragraph(P(""));
+        var hwpx = await ConvertAsync(docx, "table-border-heights");
+        var rowHeights = Xml(hwpx).Descendants(Hp + "tbl")
+            .Select(table => table.Descendants(Hp + "cellSz").Select(size => Int(size, "height")).ToArray())
+            .ToArray();
+
+        Assert.Equal(rowHeights[0].Select(height => height + 50), rowHeights[1]);
+        Assert.Equal(rowHeights[0].Select(height => height + 100), rowHeights[2]);
+        Assert.Equal(rowHeights[0], rowHeights[3]);
+        Assert.Equal(rowHeights[4], rowHeights[5]);
+    }
+
+    [Fact]
+    public async Task Built_in_word_pdf_paginates_bordered_rows_with_a_repeated_header()
+    {
+        var rhwp = fx.Converters.Single(c => c.Id == "rhwp");
+        Assert.SkipUnless(fx.Catalog.StatusOf(rhwp).IsAvailable, "rhwp is not available");
+        var builtIn = new ConverterCatalog(fx.Converters.Where(c => c.Id is "hwpx-writer" or "rhwp"));
+        var docx = new DocxBuilder
+        {
+            SectionProperties = DefaultPage.Replace("16838", "17038", StringComparison.Ordinal),
+        };
+        docx.Body.Append($"<w:tbl><w:tblPr>{HorizontalBorders("single", 4)}");
+        docx.Body.Append("""<w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:bottom w:w="0" w:type="dxa"/></w:tblCellMar>""");
+        docx.Body.Append("""</w:tblPr><w:tblGrid><w:gridCol w:w="3000"/></w:tblGrid>""");
+        for (var i = 0; i < 40; i++)
+        {
+            var text = i == 0 ? "TableHeader" : $"DataRow{i:00}";
+            var header = i == 0 ? "<w:tblHeader/>" : "";
+            var run = R(text, """<w:rFonts w:ascii="Arial" w:hAnsi="Arial"/><w:sz w:val="22"/>""");
+            var paragraph = P(run, """<w:spacing w:after="0" w:line="412" w:lineRule="exact"/>""");
+            docx.Body.Append($"<w:tr><w:trPr>{header}</w:trPr><w:tc>{paragraph}</w:tc></w:tr>");
+        }
+        docx.Body.Append("</w:tbl>").Append(P(""));
+
+        var input = docx.Save(Path.Combine(fx.NewFolder(), "paginated-table.docx"));
+        var job = await fx.ConvertAsync([input], new Preset { TargetFormat = "pdf" }, builtIn);
+        Assert.True(job.State == JobState.Completed, string.Join("; ", job.Files.Select(f => $"{f.ErrorKey} {f.ErrorDetail}")));
+        using var pdf = UglyToad.PdfPig.PdfDocument.Open(job.Outputs.Single());
+        Assert.Equal(2, pdf.NumberOfPages);
+        Assert.Contains("DataRow31", pdf.GetPage(1).Text);
+        Assert.DoesNotContain("DataRow32", pdf.GetPage(1).Text);
+        Assert.Contains("DataRow32", pdf.GetPage(2).Text);
+        Assert.Contains("TableHeader", pdf.GetPage(2).Text);
+    }
+
+    [Fact]
+    public async Task Numeric_ranges_that_fit_the_cell_do_not_reserve_a_second_line()
+    {
+        const string face = "Times New Roman";
+        Assert.SkipUnless(Filee.Engines.Hwp.RhwpFonts.Find(face) is { Usable: true }, $"{face} is not installed");
+        const string runProperties = """<w:rFonts w:ascii="Times New Roman" w:hAnsi="Times New Roman"/><w:sz w:val="24"/>""";
+        const string tableProperties = """
+            <w:tblPr><w:tblCellMar><w:top w:w="0" w:type="dxa"/><w:left w:w="108" w:type="dxa"/>
+              <w:bottom w:w="0" w:type="dxa"/><w:right w:w="108" w:type="dxa"/></w:tblCellMar></w:tblPr>
+            <w:tblGrid><w:gridCol w:w="1418"/></w:tblGrid>
+            """;
+        static string Row(string value) => $"<w:tr><w:tc>{P(R(value, runProperties))}</w:tc></w:tr>";
+        var docx = new DocxBuilder().Paragraph(
+            $"<w:tbl>{tableProperties}{Row("0–1,479")}{Row("1,480–2,959")}{Row("1,480–2,959–3,979")}</w:tbl>");
+        var hwpx = await ConvertAsync(docx, "numeric-row-height");
+        var heights = Xml(hwpx).Descendants(Hp + "cellSz").Select(cell => Int(cell, "height")).ToArray();
+
+        // The 60 pt range fits in 60.1 pt of content width, while the longer range needs another line.
+        Assert.Equal(heights[0], heights[1]);
+        Assert.True(heights[2] > heights[1]);
+    }
+
+    private static string HorizontalBorders(string style, int eighths) =>
+        "<w:tblBorders>" + string.Concat(new[] { "top", "insideH", "bottom" }
+            .Select(side => $"<w:{side} w:val=\"{style}\" w:sz=\"{eighths}\"/>")) + "</w:tblBorders>";
+
+    [Fact]
     public async Task Tables_keep_merged_cells_borders_and_shading()
     {
         var cell = (string content, string tcPr) => $"<w:tc><w:tcPr>{tcPr}</w:tcPr>{P(R(content))}</w:tc>";

@@ -2,6 +2,8 @@
 // of inline tabs. 한글 lays the document out again when it opens it, but simpler readers (and previews)
 // use these values as they are, so they should be close to the real layout.
 
+using SkiaSharp;
+
 namespace Filee.Engines.Hwp.Hwpx;
 
 internal sealed partial class HwpxWriter
@@ -182,7 +184,11 @@ internal sealed partial class HwpxWriter
                     // A collapsed Word table border is centered on the row edge. Each cell accounts for half
                     // of its top and bottom strokes so a shared border does not add its full width twice.
                     if (table.Rows[r].IncludeBordersInHeight && cell.Borders is { } borders)
+                    {
+                        if (cell.RowSpan == 1 && table.Rows[r].Height is { } minimum)
+                            needed = Math.Max(needed, minimum);
                         needed += (int)Math.Round((BorderWidth(borders.Top) + BorderWidth(borders.Bottom)) / 2);
+                    }
                     var last = Math.Min(r + cell.RowSpan, heights.Length) - 1;
                     var have = 0;
                     for (var i = r; i <= last; i++)
@@ -251,12 +257,17 @@ internal sealed partial class HwpxWriter
                     break;
                 case HTab:
                     {
+                        var stop = stops.FirstOrDefault(s => s.Position > x + 1);
                         // Text up to the next tab or line break, for right / center aligned stops.
                         double following = 0;
                         for (var j = i + 1; j < pieces.Count && pieces[j].Inline is not (HTab or HLineBreak); j++)
-                            following += pieces[j].Width;
+                        {
+                            var (inline, pieceWidth) = pieces[j];
+                            following += _forRhwpPdf && stop.Kind == HTabKind.Center && inline is HText text and not HEquation
+                                ? CenterTabTextWidth(text, text.Format.Size ?? size, pieceWidth)
+                                : pieceWidth;
+                        }
 
-                        var stop = stops.FirstOrDefault(s => s.Position > x + 1);
                         int type, leader;
                         double target;
                         if (stops.Count > 0 && stop.Position > x + 1)
@@ -293,5 +304,26 @@ internal sealed partial class HwpxWriter
             }
         }
         return result;
+    }
+
+    private static double CenterTabTextWidth(HText text, int size, double fallback)
+    {
+        var format = text.Format;
+        if (format.Font is not { } name || format.Spacing is not (null or 0)
+            || format.Subscript == true || format.Superscript == true || !text.Text.All(c => c is >= ' ' and <= '~'))
+            return fallback;
+
+        var style = (format.Bold == true, format.Italic == true) switch
+        {
+            (true, true) => SKFontStyle.BoldItalic,
+            (true, false) => SKFontStyle.Bold,
+            (false, true) => SKFontStyle.Italic,
+            _ => SKFontStyle.Normal,
+        };
+        var face = SKFontManager.Default.MatchFamily(name, style);
+        if (face is null || !face.FamilyName.Equals(name, StringComparison.OrdinalIgnoreCase))
+            return fallback;
+        using var font = new SKFont(face, size);
+        return font.MeasureText(text.Text);
     }
 }

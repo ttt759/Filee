@@ -28,6 +28,89 @@ public class DocxToHwpxTests(EngineFixture fx) : IClassFixture<EngineFixture>
 
     private static int Int(XElement element, string attribute) => (int)element.Attribute(attribute)!;
 
+    [Theory]
+    [InlineData("zh-CN", "SimSun", "SimHei")]
+    [InlineData("zh-Hant", "MingLiU", "Microsoft JhengHei")]
+    [InlineData("ja-JP", "MS Mincho", "Yu Gothic")]
+    [InlineData("ko-KR", "Batang", "Malgun Gothic")]
+    public void Word_east_asian_theme_fonts_follow_the_document_language(string language, string minor, string major)
+    {
+        var docx = new DocxBuilder
+        {
+            Settings = $"<w:themeFontLang w:val=\"en-US\" w:eastAsia=\"{language}\"/>",
+            Theme = """
+                <a:fontScheme name="Localized">
+                  <a:majorFont><a:latin typeface="Calibri"/><a:ea typeface=""/>
+                    <a:font script="Hans" typeface="SimHei"/><a:font script="Hant" typeface="Microsoft JhengHei"/>
+                    <a:font script="Jpan" typeface="Yu Gothic"/><a:font script="Hang" typeface="Malgun Gothic"/>
+                  </a:majorFont>
+                  <a:minorFont><a:latin typeface="Arial"/><a:ea typeface=""/>
+                    <a:font script="Hans" typeface="SimSun"/><a:font script="Hant" typeface="MingLiU"/>
+                    <a:font script="Jpan" typeface="MS Mincho"/><a:font script="Hang" typeface="Batang"/>
+                  </a:minorFont>
+                </a:fontScheme>
+                """,
+        };
+        docx.Paragraph(P(R("正文", """<w:rFonts w:asciiTheme="minorEastAsia" w:eastAsiaTheme="minorEastAsia"/>""")
+            + R("標題", """<w:rFonts w:asciiTheme="majorHAnsi" w:eastAsiaTheme="majorEastAsia"/>""")));
+
+        var directory = fx.NewFolder();
+        var model = DocxReader.Read(docx.Save(Path.Combine(directory, "theme.docx")), Path.Combine(directory, "media"));
+        var paragraph = Assert.IsType<HParagraph>(Assert.Single(Assert.Single(model.Sections).Blocks));
+        var text = paragraph.Inlines.OfType<HText>().ToList();
+        Assert.Collection(text,
+            run => Assert.Equal((minor, minor), (run.Format.Font, run.Format.EastAsianFont)),
+            run => Assert.Equal(("Calibri", major), (run.Format.Font, run.Format.EastAsianFont)));
+    }
+
+    [Fact]
+    public void A_word_center_tab_uses_actual_bold_letter_widths()
+    {
+        var face = SkiaSharp.SKFontManager.Default.MatchFamily("Cambria", SkiaSharp.SKFontStyle.Bold);
+        Assert.SkipUnless(face?.FamilyName == "Cambria", "Cambria is not installed");
+        using var font = new SkiaSharp.SKFont(face!, 1600);
+        const string title = "AUTHENTICATION SECURITY GUIDANCE";
+        var docx = new DocxBuilder().Paragraph(P("""<w:r><w:tab/></w:r>"""
+            + R(title, """<w:rFonts w:ascii="Cambria"/><w:b/><w:sz w:val="32"/>"""),
+            """<w:tabs><w:tab w:val="center" w:pos="5000"/></w:tabs>"""));
+        var dir = fx.NewFolder();
+        var model = DocxReader.Read(docx.Save(Path.Combine(dir, "center-tab.docx")), Path.Combine(dir, "media"));
+        var path = Path.Combine(dir, "center-tab.hwpx");
+        HwpxWriter.Write(model, path, forRhwpPdf: true);
+
+        var tab = Assert.Single(Xml(path).Descendants(Hp + "tab"));
+        var expected = (int)(25000 - font.MeasureText(title) / 2);
+        Assert.InRange(Int(tab, "width"), expected - 1, expected + 1);
+    }
+
+    [Fact]
+    public void Word_contents_links_keep_the_entry_style_and_their_destination()
+    {
+        var docx = new DocxBuilder();
+        const string linkRun = """<w:rStyle w:val="Hyperlink"/>""";
+        var field = """
+            <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+            <w:r><w:instrText> TOC \h </w:instrText></w:r>
+            <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+            """;
+        var entry = """<w:hyperlink w:anchor="_Toc1">""" + R("Contents entry", linkRun) + "</w:hyperlink>";
+        docx.Paragraph(P(field + entry + """<w:r><w:fldChar w:fldCharType="end"/></w:r>"""));
+        var external = docx.Hyperlink("https://example.com/");
+        docx.Paragraph(P($"<w:hyperlink r:id=\"{external}\">{R("External link", linkRun)}</w:hyperlink>"));
+
+        var directory = fx.NewFolder();
+        var model = DocxReader.Read(docx.Save(Path.Combine(directory, "toc.docx")), Path.Combine(directory, "media"));
+        var links = HDocumentWalker.Inlines(Assert.Single(model.Sections).Blocks).OfType<HLink>().ToArray();
+        Assert.Equal(2, links.Length);
+        Assert.Equal("#_Toc1", links[0].Target);
+        var contents = Assert.IsType<HText>(Assert.Single(links[0].Content));
+        Assert.Equal("#000000", contents.Format.Color);
+        Assert.False(contents.Format.Underline);
+        var normal = Assert.IsType<HText>(Assert.Single(links[1].Content));
+        Assert.Equal("#0563C1", normal.Format.Color);
+        Assert.True(normal.Format.Underline);
+    }
+
     [Fact]
     public async Task Page_setup_headers_footers_and_page_numbers()
     {
@@ -245,6 +328,7 @@ public class DocxToHwpxTests(EngineFixture fx) : IClassFixture<EngineFixture>
         }
 
         const string fixedHeight = """<w:trHeight w:val="20" w:hRule="exact"/>""";
+        const string minimumHeight = """<w:trHeight w:val="369"/>""";
         var docx = new DocxBuilder()
             .Paragraph(Table("nil", 8))
             .Paragraph(Table("single", 4))
@@ -252,6 +336,7 @@ public class DocxToHwpxTests(EngineFixture fx) : IClassFixture<EngineFixture>
             .Paragraph(Table("single", 8, """<w:tblCellSpacing w:w="20" w:type="dxa"/>"""))
             .Paragraph(Table("nil", 8, rowProperties: fixedHeight))
             .Paragraph(Table("single", 8, rowProperties: fixedHeight))
+            .Paragraph(Table("single", 4, rowProperties: minimumHeight))
             .Paragraph(P(""));
         var hwpx = await ConvertAsync(docx, "table-border-heights");
         var rowHeights = Xml(hwpx).Descendants(Hp + "tbl")
@@ -262,6 +347,7 @@ public class DocxToHwpxTests(EngineFixture fx) : IClassFixture<EngineFixture>
         Assert.Equal(rowHeights[0].Select(height => height + 100), rowHeights[2]);
         Assert.Equal(rowHeights[0], rowHeights[3]);
         Assert.Equal(rowHeights[4], rowHeights[5]);
+        Assert.Equal([1895, 1895], rowHeights[6]);
     }
 
     [Fact]

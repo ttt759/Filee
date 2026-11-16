@@ -1,11 +1,36 @@
 using System.IO.Compression;
 using System.Text;
+using Filee.Core.Conversion;
+using Filee.Core.Presets;
 using Filee.Engines.Office;
+using static Filee.Engines.Tests.DocxBuilder;
 
 namespace Filee.Engines.Tests;
 
 public class DocumentFontsTests
 {
+    [Fact]
+    public async Task Built_in_word_pdf_reports_the_font_in_the_text_and_ignores_unused_styles()
+    {
+        using var fx = new EngineFixture();
+        var rhwp = fx.Converters.Single(converter => converter.Id == "rhwp");
+        Assert.SkipUnless(fx.Catalog.StatusOf(rhwp).IsAvailable, "rhwp not found");
+        var docx = new DocxBuilder().Paragraph(P(R("Sample text", """<w:rFonts w:ascii="Filee Unavailable Active Face"/>""")));
+        docx.Styles += """
+            <w:style w:type="paragraph" w:styleId="Unused">
+              <w:rPr><w:rFonts w:ascii="Filee Unavailable Unused Face"/></w:rPr>
+            </w:style>
+            """;
+        var source = docx.Save(Path.Combine(fx.NewFolder(), "font-preflight.docx"));
+        var catalog = new ConverterCatalog(fx.Converters.Where(converter => converter.Id is "hwpx-writer" or "rhwp"));
+        var job = await fx.ConvertAsync([source], new Preset { TargetFormat = "pdf" }, catalog);
+
+        Assert.Equal(JobState.Completed, job.State);
+        var missing = Assert.Single(job.Files).MissingFonts;
+        Assert.Contains("Filee Unavailable Active Face", missing);
+        Assert.DoesNotContain("Filee Unavailable Unused Face", missing);
+    }
+
     [Fact]
     public void Finds_fonts_used_by_ooxml_and_hwpx_but_not_embedded_or_theme_placeholders()
     {

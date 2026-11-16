@@ -23,6 +23,17 @@ public class DocxFirstPageHeaderTests(EngineFixture fx) : IClassFixture<EngineFi
 
     private static string Body() => P(R("Contents")) + $"<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>{P(R("Second"))}";
 
+    private static DocxBuilder WithTallDefaultFooter(int bottom)
+    {
+        const string spacing = """<w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="exact"/>""";
+        var docx = new DocxBuilder();
+        var footer = docx.Footer(P(R("FooterOne"), spacing) + P(R("FooterTwo"), spacing) + P(R("FooterThree"), spacing));
+        docx.Paragraph(Body());
+        var pageMargins = DefaultPage.Replace("w:bottom=\"1440\"", $"w:bottom=\"{bottom}\"");
+        docx.SectionProperties = $"""<w:footerReference w:type="default" r:id="{footer}"/>""" + pageMargins + TitlePage;
+        return docx;
+    }
+
     private async Task<List<(string Text, List<UglyToad.PdfPig.Content.Word> Words)>> PagesAsync(DocxBuilder docx)
     {
         var rhwp = fx.Converters.Single(c => c.Id == "rhwp");
@@ -49,6 +60,57 @@ public class DocxFirstPageHeaderTests(EngineFixture fx) : IClassFixture<EngineFi
         var label = pages[0].Words.Last(w => w.Text == "Classification");
         var body = pages[0].Words.First(w => w.Text == "Contents");
         Assert.True(label.BoundingBox.Bottom > body.BoundingBox.Top, "the body starts below the table");
+    }
+
+    [Fact]
+    public async Task An_empty_opening_paragraph_keeps_its_line_height_below_the_first_page_header()
+    {
+        const string spacing = """<w:spacing w:before="0" w:after="0" w:line="480" w:lineRule="exact"/>""";
+        async Task<List<(string Text, List<UglyToad.PdfPig.Content.Word> Words)>> ConvertAsync(string opening)
+        {
+            var docx = new DocxBuilder();
+            var first = docx.Header(Table(P(R("Classification"))) + P(""));
+            docx.Paragraph(opening + Body());
+            docx.SectionProperties = Reference(first, "first") + DefaultPage + TitlePage;
+            return await PagesAsync(docx);
+        }
+
+        var withBlank = await ConvertAsync(P("", spacing));
+        var withoutBlank = await ConvertAsync("");
+
+        Assert.Equal(2, withBlank.Count);
+        Assert.Equal(2, withoutBlank.Count);
+        Assert.InRange(Top(withoutBlank, 0, "Contents") - Top(withBlank, 0, "Contents"), 23.5, 24.5);
+        Assert.Equal(Top(withoutBlank, 1, "Second"), Top(withBlank, 1, "Second"), precision: 2);
+
+        static double Top(List<(string Text, List<UglyToad.PdfPig.Content.Word> Words)> pages, int page, string word) =>
+            pages[page].Words.Single(w => w.Text == word).BoundingBox.Top;
+    }
+
+    [Fact]
+    public async Task A_tall_default_footer_fits_above_its_distance_from_the_paper_edge()
+    {
+        var pages = await PagesAsync(WithTallDefaultFooter(936));
+
+        Assert.Equal(2, pages.Count);
+        Assert.DoesNotContain("FooterOne", pages[0].Text);
+        Assert.Contains("Second", pages[1].Text);
+        var first = pages[1].Words.Single(w => w.Text == "FooterOne").BoundingBox.Bottom;
+        var last = pages[1].Words.Single(w => w.Text == "FooterThree").BoundingBox.Bottom;
+        Assert.InRange(first - last, 23.5, 24.5);
+        Assert.InRange(last, 35, 44); // the DOCX sets the footer distance at 36 pt
+    }
+
+    [Fact]
+    public void A_negative_bottom_margin_keeps_the_explicit_body_bottom()
+    {
+        var dir = fx.NewFolder();
+        var source = WithTallDefaultFooter(-936).Save(Path.Combine(dir, "source.docx"));
+        var hwpx = Path.Combine(dir, "out.hwpx");
+        HwpxWriter.Write(DocxReader.Read(source, Path.Combine(dir, "media")), hwpx, forRhwpPdf: true);
+
+        var margin = Xml(hwpx).Descendants(Hp + "pagePr").Single().Element(Hp + "margin")!;
+        Assert.Equal(4680, (int)margin.Attribute("bottom")! + (int)margin.Attribute("footer")!);
     }
 
     [Fact]

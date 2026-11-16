@@ -41,6 +41,8 @@ internal sealed partial class DocxReader
     private Part? _footnotesPart;
     private Part? _endnotesPart;
     private bool _evenAndOddHeaders;
+    private int _mathWrapIndent;
+    private bool _mathWrapRight;
 
     /// <summary>Width of each section's text column (HWPUNIT), for equations that don't fit a line.</summary>
     private readonly List<int> _columnWidths = [];
@@ -176,10 +178,15 @@ internal sealed partial class DocxReader
         var main = _part;
         LoadStyles(RelatedPart(main, "/styles"));
         var theme = RelatedPart(main, "/theme");
-        LoadTheme(theme);
+        var settings = RelatedPart(main, "/settings")?.Xml.Root;
+        LoadTheme(theme, settings?.Element(W + "themeFontLang"));
         LoadThemeColors(theme);
         LoadNumbering(RelatedPart(main, "/numbering"));
-        _evenAndOddHeaders = RelatedPart(main, "/settings")?.Xml.Root?.Element(W + "evenAndOddHeaders") is { } evenOdd && Val(evenOdd) is not ("0" or "false");
+        _evenAndOddHeaders = settings?.Element(W + "evenAndOddHeaders") is { } evenOdd && Val(evenOdd) is not ("0" or "false");
+        var math = settings?.Element(M + "mathPr");
+        var wrapIndent = int.TryParse(Attr(math?.Element(M + "wrapIndent"), "val", M), out var indent) ? indent : 1440;
+        _mathWrapIndent = HwpxUnits.FromTwips(Math.Clamp(wrapIndent, 0, 31680));
+        _mathWrapRight = math?.Element(M + "wrapRight") is { } wrapRight && Attr(wrapRight, "val", M) is not ("0" or "false" or "off");
         _footnotesPart = RelatedPart(main, "/footnotes");
         _endnotesPart = RelatedPart(main, "/endnotes");
         foreach (var note in _footnotesPart?.Xml.Root?.Elements(W + "footnote") ?? [])
@@ -262,7 +269,14 @@ internal sealed partial class DocxReader
             return;
         }
 
-        var section = new HSection { Page = page, Columns = columns, HeaderMovesBody = Twips(sectPr?.Element(W + "pgMar"), "top") is not < 0 };
+        var margins = sectPr?.Element(W + "pgMar");
+        var section = new HSection
+        {
+            Page = page,
+            Columns = columns,
+            HeaderMovesBody = Twips(margins, "top") is not < 0,
+            FooterMovesBody = Twips(margins, "bottom") is not < 0 && !IsBlank(footers.GetValueOrDefault("default")),
+        };
         section.Blocks.AddRange(blocks);
 
         void Add(Dictionary<string, List<HBlock>> source, List<HHeaderFooter> target, HParagraph? startsAt = null)
@@ -432,15 +446,26 @@ internal sealed partial class DocxReader
 
     /// <summary>
     /// A paragraph's single line height as a percentage of its largest font size: its tallest text decides, as on a line
-    /// in Word. A paragraph without text has the height of its mark, or of the equation or picture in it: 100%, since
-    /// 한글's percentage of a tall object would leave a third of its height empty above it.
+    /// in Word. A paragraph without text uses its mark's line height or its inline object's height. In Word, a
+    /// display equation also has at least the natural line height of its font.
     /// </summary>
     private static double SingleLinePercent(HParagraph paragraph)
     {
         var (size, height, inlineObject) = (0, 0.0, false);
         Measure(paragraph.Inlines);
         if (size == 0 && inlineObject)
+        {
+            if (paragraph.Inlines.All(i => i is HEquation or HBookmark or HTextBox { IsEquationNumber: true })
+                && paragraph.Inlines.OfType<HEquation>().FirstOrDefault()
+                is HEquation { Format: { Font: { } font, Size: > 0 and var fontSize } } equation
+                && SingleLineHeights.TryGetValue(font, out var singleLine))
+            {
+                var boxHeight = EquationScript.Measure(equation.Math, fontSize).Height;
+                if (boxHeight > 0)
+                    return Math.Max(100, singleLine * fontSize / boxHeight);
+            }
             return 100;
+        }
         if (size == 0 && paragraph.MarkFormat is var mark)
             Add("", mark);
         return height / size;
@@ -664,13 +689,12 @@ internal sealed partial class DocxReader
         }
 
         /// <summary>Continues in a new paragraph right under this one (the next line of a long equation).</summary>
-        public void NextRow()
+        public void NextRow(HParaFormat continuation)
         {
-            var format = Current.Format;
-            Current.Format = format with { After = 0 };
+            Current.Format = Current.Format with { After = 0 };
             Emit();
             Current = NewParagraph(_list is null ? null : _list with { Numbered = false });
-            Current.Format = format with { Before = 0 };
+            Current.Format = continuation with { Before = 0 };
             _startsWithRunPageBreak = false;
             _sinks.Clear();
         }
@@ -782,7 +806,10 @@ internal sealed partial class DocxReader
 
     private void Run(XElement r, ParagraphBuilder builder, RunProps styleRun)
     {
-        var props = RunProperties(r.Element(W + "rPr"), styleRun);
+        // Word prints cached table-of-contents entries in the entry's paragraph style.
+        var tocLink = r.Parent?.Name == W + "hyperlink" && Attr(r.Parent, "anchor") is not null
+            && _fields.Any(field => field.TableOfContents);
+        var props = RunProperties(r.Element(W + "rPr"), styleRun, tocLink);
         if (props.Hidden == true)
             return;
         var format = CharFormat(props);
@@ -901,8 +928,9 @@ internal sealed partial class DocxReader
         var format = CharFormat(RunProperties(rPr, styleRun)) with { Italic = true };
         var lines = math.Name.LocalName == "oMathPara" ? math.Elements(M + "oMath").ToList() : [math];
 
-        if (math.Name.LocalName == "oMathPara" && math.Parent is { } paragraph
-            && !paragraph.Descendants(W + "t").Any(t => t.Value.Trim().Length > 0 && !t.Ancestors(M + "oMathPara").Any()))
+        var display = math.Name.LocalName == "oMathPara" && math.Parent is { } paragraph
+            && !paragraph.Descendants(W + "t").Any(t => t.Value.Trim().Length > 0 && !t.Ancestors(M + "oMathPara").Any());
+        if (display)
         {
             var align = Attr(math.Element(M + "oMathParaPr")?.Element(M + "jc"), "val", M) switch
             {
@@ -918,7 +946,22 @@ internal sealed partial class DocxReader
 
         // Width of the line in the body; in a cell or a text box the width isn't known here.
         var inBody = _textBoxDepth == 0 && !math.Ancestors(W + "tc").Any() && _sectionIndex < _columnWidths.Count;
-        var width = inBody ? _columnWidths[_sectionIndex] - (builder.Current.Format.Left ?? 0) - (builder.Current.Format.Right ?? 0) : 0;
+        var paragraphStyle = builder.Current.Format;
+        var left = paragraphStyle.Left ?? 0;
+        var width = inBody ? _columnWidths[_sectionIndex] - left - (paragraphStyle.Right ?? 0) : 0;
+        var firstWidth = width - (display && width > 0 ? paragraphStyle.FirstLine ?? 0 : 0);
+        var continuation = paragraphStyle;
+        var continuationWidth = width;
+        if (display && _mathWrapRight)
+        {
+            continuation = continuation with { Align = HAlign.Right, FirstLine = 0 };
+        }
+        else if (display && paragraphStyle.Align == HAlign.Left)
+        {
+            var indent = _mathWrapIndent < width ? _mathWrapIndent : 0;
+            continuation = continuation with { Left = left + indent, FirstLine = 0 };
+            continuationWidth -= indent;
+        }
 
         var first = true;
         foreach (var line in lines)
@@ -949,12 +992,12 @@ internal sealed partial class DocxReader
                 continue;
             }
 
-            var rows = EquationScript.BreakLines(body, width, format.Size ?? 1000);
+            var rows = EquationScript.BreakLines(body, firstWidth, continuationWidth, format.Size ?? 1000);
             for (var i = 0; i < rows.Count; i++)
             {
                 // Paragraphs of their own: rhwp draws the first equation of a paragraph split by a page again on the next page.
                 if (i > 0)
-                    builder.NextRow();
+                    builder.NextRow(continuation);
                 builder.Add(new HEquation(rows[i], format));
             }
         }
@@ -1033,6 +1076,7 @@ internal sealed partial class DocxReader
         public readonly StringBuilder Instruction = new();
         public bool Result;
         public bool Suppress;
+        public bool TableOfContents;
         public string? Target;
         public CachedPageField? PageField;
     }
@@ -1081,6 +1125,9 @@ internal sealed partial class DocxReader
         var words = SplitInstruction(field.Instruction.ToString());
         switch (words.FirstOrDefault()?.ToUpperInvariant())
         {
+            case "TOC":
+                field.TableOfContents = true;
+                break;
             case "PAGE" or "NUMPAGES" or "SECTIONPAGES" when _inFirstPageHeader && _tableDepth > 0:
                 // rhwp leaves native page numbers in a table in a text box blank. Retain the cache and the field kind.
                 field.PageField = new CachedPageField(words[0].ToUpperInvariant() switch

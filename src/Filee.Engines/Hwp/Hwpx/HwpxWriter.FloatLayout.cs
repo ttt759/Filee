@@ -13,7 +13,7 @@ internal sealed partial class HwpxWriter
             return Table(table, leadingRun);
 
         var (cells, columns) = PlaceCells(table);
-        var widths = ColumnWidths(table, columns, Math.Max(4000, _width - table.Indent));
+        var widths = ColumnWidths(table, columns, TableAvailableWidth(table));
         var height = EstimateRowHeights(table, cells, widths).Sum();
         var space = table.OuterMargin;
         if (anchor is { HorizontalAlign: "CENTER", HorizontalOffset: 0 })

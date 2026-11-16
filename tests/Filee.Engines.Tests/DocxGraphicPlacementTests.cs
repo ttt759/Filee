@@ -66,6 +66,24 @@ public class DocxGraphicPlacementTests(EngineFixture fx) : IClassFixture<EngineF
     }
 
     [Fact]
+    public async Task A_table_positioned_on_the_paper_can_extend_into_the_body_margins()
+    {
+        var docx = new DocxBuilder().Paragraph(P(R("Before the table"))).Paragraph("""
+            <w:tbl>
+              <w:tblPr><w:tblpPr w:horzAnchor="page" w:tblpX="201" w:vertAnchor="text" w:tblpY="61"/>
+                <w:tblW w:w="10700" w:type="dxa"/><w:tblLayout w:type="fixed"/></w:tblPr>
+              <w:tblGrid><w:gridCol w:w="2700"/><w:gridCol w:w="8000"/></w:tblGrid>
+              <w:tr><w:tc><w:p><w:r><w:t>First cell</w:t></w:r></w:p></w:tc>
+                    <w:tc><w:p><w:r><w:t>Second cell</w:t></w:r></w:p></w:tc></w:tr>
+            </w:tbl>
+            """);
+        var hwpx = await ConvertAsync(docx, "page-wide-table");
+        var table = Assert.Single(Xml(hwpx).Descendants(Hp + "tbl"));
+        Assert.Equal(53500, (int)table.Element(Hp + "sz")!.Attribute("width")!);
+        Assert.Equal([13500, 40000], table.Descendants(Hp + "cellSz").Select(cell => (int)cell.Attribute("width")!));
+    }
+
+    [Fact]
     public async Task Vml_watermark_has_a_rotated_translucent_picture_and_hidden_shapes_are_omitted()
     {
         var docx = new DocxBuilder();

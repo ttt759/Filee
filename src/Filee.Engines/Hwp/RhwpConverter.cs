@@ -93,9 +93,16 @@ public sealed class RhwpConverter : IConverter, ITextShapingCheck
         var temp = Path.Combine(step.WorkDirectory, $"rhwp-{Guid.NewGuid():N}.{step.To}");
         try
         {
-            // Intermediate HWPX files include template fonts the user's original document never requested.
-            if (step.To == "pdf" && DocumentFonts.Missing(step.OriginalSourcePath ?? step.InputPath) is [_, ..] missing)
-                step.MissingFonts?.Invoke(missing);
+            if (step.To == "pdf")
+            {
+                var source = step.OriginalSourcePath ?? step.InputPath;
+                var word = FormatRegistry.Detect(source)?.Id is "docx" or "docm" or "dotx" or "dotm";
+                // The original declares unused styles. The intermediate includes its own template fonts.
+                // On the built-in Word route both must refer to a family before we report it missing.
+                var resolvedFonts = word && step.From == "hwpx" ? step.InputPath : null;
+                if (DocumentFonts.Missing(source, resolvedFonts) is [_, ..] missing)
+                    step.MissingFonts?.Invoke(missing);
+            }
             var input = step.To == "pdf" ? await PrepareAsync(exe, step, cancellationToken) : step.InputPath;
             var text = TextSize(input);
             var characters = step.To == "pdf" ? Characters(input) : null;

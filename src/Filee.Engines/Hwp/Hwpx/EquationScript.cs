@@ -104,11 +104,11 @@ internal static class EquationScript
     // ───────────────────────── Lines ─────────────────────────
 
     /// <summary>
-    /// An equation wider than <paramref name="width"/> cut into lines before its + - = signs, as Word breaks a long one
-    /// (rhwp draws an equation on one line, past the margin). What doesn't fit or has no such sign stays as it is.
+    /// A wide equation cut into lines before top-level binary operators. What has no legal break stays together.
     /// </summary>
-    /// <param name="width">Width of a line, 0 when it isn't known.</param>
-    public static IReadOnlyList<MathNode> BreakLines(MathNode equation, double width, double size)
+    /// <param name="width">Width of the first line, 0 when it isn't known.</param>
+    /// <param name="continuationWidth">Width of subsequent lines after their wrap indent.</param>
+    public static IReadOnlyList<MathNode> BreakLines(MathNode equation, double width, double continuationWidth, double size)
     {
         var inner = equation;
         while (inner is MathRow { Items: [MathRow only] })
@@ -127,22 +127,36 @@ internal static class EquationScript
             {
                 lines.Add(new MathRow(line));
                 (line, lineWidth) = ([], 0);
+                width = continuationWidth;
             }
             line.AddRange(pending);
             lineWidth += pendingWidth;
             (pending, pendingWidth) = ([], 0);
         }
+        var depth = 0;
+        var previousIsOperand = false;
         foreach (var item in row.Items)
         {
-            if (item is MathSymbol { Text: "+" or "-" or "=" } && pending.Count > 0)
+            var isOperator = IsBinaryOperator(item);
+            if (depth == 0 && isOperator && previousIsOperand)
                 Flush();
             pending.Add(item);
             pendingWidth += Measure(item, size).Width;
+            if (item is MathSymbol { Text: "(" or "[" })
+                depth++;
+            else if (item is MathSymbol { Text: ")" or "]" })
+                depth = Math.Max(0, depth - 1);
+            if (item is not (MathSpace or MathAlign))
+                previousIsOperand = !isOperator && item is not MathSymbol { Text: "(" or "[" };
         }
         Flush();
         lines.Add(new MathRow(line));
         return lines;
     }
+
+    private static bool IsBinaryOperator(MathNode item) => item is
+        MathSymbol { Text: "+" or "-" or "=" or "<" or ">" or "*" or "/" }
+        or MathCommand { Command: "PLUSMINUS" or "MINUSPLUS" or "TIMES" or "DIV" or "CDOT" or "NEQ" or "LEQ" or "GEQ" or "APPROX" or "EQUIV" };
 
     // ───────────────────────── Script ─────────────────────────
 

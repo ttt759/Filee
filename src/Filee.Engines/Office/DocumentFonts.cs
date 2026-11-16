@@ -42,15 +42,18 @@ internal static class DocumentFonts
             ["Times New Roman"] = ["Liberation Serif"],
         };
 
-    public static IReadOnlyList<string> Missing(string path) => Missing(path, Installed);
+    public static IReadOnlyList<string> Missing(string path, string? renderedFontsFrom = null) =>
+        Missing(path, Installed, renderedFontsFrom);
 
-    internal static IReadOnlyList<string> Missing(string path, Func<string, bool> installed)
+    internal static IReadOnlyList<string> Missing(string path, Func<string, bool> installed, string? renderedFontsFrom = null)
     {
         try
         {
             if (!PackageExtensions.Contains(Path.GetExtension(path)))
                 return [];
-            var referenced = Referenced(path);
+            IEnumerable<string> referenced = Referenced(path);
+            if (renderedFontsFrom is not null)
+                referenced = referenced.Intersect(Referenced(renderedFontsFrom), StringComparer.OrdinalIgnoreCase);
             return referenced.Where(face => !installed(face)
                     && (!MetricAliases.TryGetValue(face, out var aliases) || !aliases.Any(installed)))
                 .Order(StringComparer.OrdinalIgnoreCase)

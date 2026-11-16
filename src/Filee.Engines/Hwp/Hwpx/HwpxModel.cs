@@ -35,6 +35,9 @@ internal sealed class HSection
     /// <summary>A header taller than the room above the body moves the body down (Word, unless its top margin is negative).</summary>
     public bool HeaderMovesBody { get; set; }
 
+    /// <summary>A nonblank Word footer can move the body up when the bottom margin is nonnegative.</summary>
+    public bool FooterMovesBody { get; set; }
+
     public List<HBlock> Blocks { get; } = [];
 }
 

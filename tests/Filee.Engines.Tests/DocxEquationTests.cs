@@ -163,6 +163,28 @@ public class DocxEquationTests(EngineFixture fx) : IClassFixture<EngineFixture>
         Assert.Equal(HwpxUnits.FromTwips(200), paragraphs[^1].Format.After);
     }
 
+    [Theory]
+    [InlineData(false, 2000)]
+    [InlineData(true, 0)]
+    public void A_left_display_wraps_at_multiplication_and_positions_its_continuations(bool wrapRight, int left)
+    {
+        var docx = new DocxBuilder
+        {
+            SectionProperties = DocxBuilder.DefaultPage.Replace("11906", "4880"),
+            Settings = $"""<m:mathPr><m:wrapIndent m:val="400"/>{(wrapRight ? "<m:wrapRight/>" : "")}</m:mathPr>""",
+        };
+        var body = MR("1234567890+123456⋅x+123456⋅y+123456⋅z");
+        var paragraphs = ReadParagraphs(docx.Paragraph(P($"<m:oMathPara><m:oMathParaPr><m:jc m:val=\"left\"/></m:oMathParaPr>{Math(body)}</m:oMathPara>")));
+
+        var align = wrapRight ? HAlign.Right : HAlign.Left;
+        Assert.Collection(paragraphs,
+            p => Assert.Equal((0, HAlign.Left), (p.Format.Left, p.Format.Align)),
+            p => Assert.Equal((left, align), (p.Format.Left, p.Format.Align)),
+            p => Assert.Equal((left, align), (p.Format.Left, p.Format.Align)));
+        var rows = paragraphs.Select(p => Assert.IsType<HEquation>(Assert.Single(p.Inlines)).Math);
+        Assert.Equal(["1234567890 + 123456", "CDOT x + 123456 CDOT y", "+ 123456 CDOT z"], rows.Select(EquationScript.Script));
+    }
+
     [Fact]
     public void An_equation_that_fits_or_is_in_a_cell_stays_on_one_line()
     {
@@ -304,6 +326,23 @@ public class DocxEquationTests(EngineFixture fx) : IClassFixture<EngineFixture>
         var equals = page.Letters.Where(l => l.Value == "=").Select(l => l.StartBaseLine.Y).OrderDescending().ToArray();
         Assert.Equal(7, equals.Length);
         Assert.InRange(equals[4] - equals[5], 0, 40);
+    }
+
+    [Fact]
+    public async Task Short_display_equations_use_the_math_fonts_line_height_for_multiple_spacing()
+    {
+        var rhwp = fx.Converters.Single(c => c.Id == "rhwp");
+        Assert.SkipUnless(fx.Catalog.StatusOf(rhwp).IsAvailable, "rhwp not found (pwsh build/fetch-engines.ps1 -Only rhwp)");
+        const string equation = """
+            <m:r><w:rPr><w:rFonts w:ascii="Cambria Math"/><w:sz w:val="28"/></w:rPr><m:t>x=1</m:t></m:r>
+            """;
+        const string spacing = """<w:spacing w:line="360" w:lineRule="auto"/>""";
+        var source = new DocxBuilder().Paragraph(P(Display(equation), spacing)).Paragraph(P(Display(equation), spacing));
+
+        using var pdf = PdfDocument.Open(await ConvertAsync(source, "display-line-spacing", "pdf"));
+        var equals = Assert.Single(pdf.GetPages()).Letters.Where(l => l.Value == "=").Select(l => l.StartBaseLine.Y).OrderDescending().ToArray();
+        Assert.Equal(2, equals.Length);
+        Assert.InRange(equals[0] - equals[1], 24.4, 25.2);
     }
 
     [Fact]

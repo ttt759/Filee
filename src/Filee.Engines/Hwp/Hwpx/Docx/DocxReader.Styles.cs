@@ -28,6 +28,7 @@ internal sealed partial class DocxReader
         ["Calibri"] = 122.1,
         ["Calibri Light"] = 122.1,
         ["Cambria"] = 117.2,
+        ["Cambria Math"] = 117.3,
         ["Candara"] = 122.1,
         ["Caladea"] = 117.2,
         ["Carlito"] = 122.1,
@@ -266,20 +267,44 @@ internal sealed partial class DocxReader
         }
     }
 
-    private void LoadTheme(Part? part)
+    private void LoadTheme(Part? part, XElement? languages)
     {
         var fonts = part?.Xml.Descendants(A + "fontScheme").FirstOrDefault();
+        var latinScript = EastAsianScript(Attr(languages, "val"));
+        var eastAsianScript = EastAsianScript(Attr(languages, "eastAsia"));
         (string?, string?) Read(string name)
         {
             var font = fonts?.Element(A + name);
-            var latin = Attr(font?.Element(A + "latin"), "typeface");
-            var eastAsian = Attr(font?.Element(A + "ea"), "typeface");
-            if (string.IsNullOrEmpty(eastAsian))
-                eastAsian = Attr(font?.Elements(A + "font").FirstOrDefault(f => Attr(f, "script") == "Hang"), "typeface");
-            return (NullIfEmpty(latin), NullIfEmpty(eastAsian));
+            string? Face(XElement? element) => NullIfEmpty(Attr(element, "typeface"));
+            string? Supplemental(string? script) => script is null ? null
+                : Face(font?.Elements(A + "font").FirstOrDefault(f => Attr(f, "script") == script));
+
+            // The language in w:themeFontLang selects the matching supplemental font.
+            // Themes often have an empty a:ea and name their East Asian faces only by script.
+            var latin = Supplemental(latinScript) ?? Face(font?.Element(A + "latin"));
+            var eastAsian = Supplemental(eastAsianScript) ?? Face(font?.Element(A + "ea"))
+                ?? (eastAsianScript is null ? Supplemental("Hang") : null);
+            return (latin, eastAsian);
         }
         _minorFont = Read("minorFont");
         _majorFont = Read("majorFont");
+    }
+
+    private static string? EastAsianScript(string? language)
+    {
+        var parts = language?.ToLowerInvariant().Split('-');
+        if (parts is null)
+            return null;
+        return parts[0] switch
+        {
+            "zh" when parts.Contains("hant") => "Hant",
+            "zh" when parts.Contains("hans") => "Hans",
+            "zh" when parts.Any(part => part is "tw" or "hk" or "mo") => "Hant",
+            "zh" => "Hans",
+            "ja" => "Jpan",
+            "ko" => "Hang",
+            _ => null,
+        };
     }
 
     private void LoadNumbering(Part? part)
@@ -407,10 +432,12 @@ internal sealed partial class DocxReader
     }
 
     /// <summary>Properties of a run inside a paragraph whose style gave <paramref name="paragraphRun"/>.</summary>
-    private RunProps RunProperties(XElement? rPr, RunProps paragraphRun)
+    private RunProps RunProperties(XElement? rPr, RunProps paragraphRun, bool tocLink = false)
     {
         var run = paragraphRun.Clone();
-        if (Val(rPr?.Element(W + "rStyle")) is { } characterStyle && _styles.TryGetValue(characterStyle, out var style))
+        if (Val(rPr?.Element(W + "rStyle")) is { } characterStyle && _styles.TryGetValue(characterStyle, out var style)
+            && !(tocLink && (characterStyle.Equals("Hyperlink", StringComparison.OrdinalIgnoreCase) ||
+                             string.Equals(style.Name, "Hyperlink", StringComparison.OrdinalIgnoreCase))))
         {
             // Character styles only carry run properties; apply their chain on top of the paragraph's.
             var chain = new List<Style>();

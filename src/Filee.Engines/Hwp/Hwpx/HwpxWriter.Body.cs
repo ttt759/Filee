@@ -20,6 +20,7 @@ internal sealed partial class HwpxWriter
     /// <summary>Distance from the paper edge to the text area of the current section (left, and top including the header).</summary>
     private int _pageLeft = 7200;
     private int _pageTop = 8505;
+    private int _paperWidth = 59530;
 
     /// <summary>Style of plain paragraphs in the current container (body text, or footnote text inside notes).</summary>
     private (string StyleId, string ParaPrId, string CharPrId) _base;
@@ -57,13 +58,19 @@ internal sealed partial class HwpxWriter
         var paperWidth = (int?)pagePr?.Attribute("width") ?? 59530;
         var paperHeight = (int?)pagePr?.Attribute("height") ?? 84190;
         var landscape = (string?)pagePr?.Attribute("landscape") == "NARROWLY";
-        var textWidth = Math.Max(2000, (landscape ? paperHeight : paperWidth) - Margin("left", 7200) - Margin("right", 7200) - Margin("gutter", 0));
+        _paperWidth = landscape ? paperHeight : paperWidth;
+        var textWidth = Math.Max(2000, _paperWidth - Margin("left", 7200) - Margin("right", 7200) - Margin("gutter", 0));
         _base = (_normalStyleId, _normalParaPrId, _normalCharPrId);
 
         // The header area is as tall as the header, as in Word. rhwp also stops at the end of the area, which left out a
         // table after an empty paragraph in a header with little room above the body (issue #1152).
         if (section.HeaderMovesBody && section.Headers.Count > 0)
             margin?.SetAttributeValue("header", Math.Max(Margin("header", 4250), section.Headers.Max(h => EstimateHeight(h.Blocks, textWidth))));
+        // The footer grows inward from the Word footer distance. A common footer can reserve its height for the
+        // whole section. Parity-specific or delayed footers would need different body sizes on different pages.
+        if (_forRhwpPdf && section.FooterMovesBody
+            && section.Footers.FirstOrDefault(f => f is { Pages: HPageType.Both, StartsAt: null }) is { } commonFooter)
+            margin?.SetAttributeValue("footer", Math.Max(Margin("footer", 2240), EstimateHeight(commonFooter.Blocks, textWidth)));
         _pageLeft = Margin("left", 7200) + Margin("gutter", 0);
         _pageTop = Margin("top", 4255) + Margin("header", 4250);
 
@@ -150,7 +157,8 @@ internal sealed partial class HwpxWriter
                 HParagraph p when wrappedLines.Remove(i, out var line) => Paragraph(p, leadingRun, line),
                 HParagraph p when _forRhwpPdf && PicturesHaveClearSpace(p, blocks, i) =>
                     Paragraph(p, leadingRun, floatPicturesInFront: true),
-                HParagraph p when _forRhwpPdf => Paragraph(p, leadingRun, drawEquationBrace: true),
+                HParagraph p when _forRhwpPdf => Paragraph(p, leadingRun, drawEquationBrace: true,
+                    preserveEmptyLine: i == 0 && section.FirstPageHeader is not null && section.Blocks.FirstOrDefault() == p),
                 var block => Block(block, leadingRun),
             };
             body.Append(xml);
@@ -202,7 +210,7 @@ internal sealed partial class HwpxWriter
     };
 
     private string Paragraph(HParagraph paragraph, string? leadingRun, string? wrappedLine = null,
-        bool floatPicturesInFront = false, bool drawEquationBrace = false)
+        bool floatPicturesInFront = false, bool drawEquationBrace = false, bool preserveEmptyLine = false)
     {
         _plainText.AppendLine();
         var (styleId, paraPrBase, charPrBase) = paragraph.HeadingLevel > 0 && _headings.TryGetValue(paragraph.HeadingLevel, out var heading)
@@ -220,6 +228,9 @@ internal sealed partial class HwpxWriter
         Inlines(paragraph.Inlines, runs, charPrBase, link: false, tabs, equationLine?.Height,
             floatPicturesInFront, floatPicturesInFront && paragraph.Inlines.All(i => i is HImage) ? markCharPr : null,
             equationLine?.Brace);
+        // rhwp skips the line of an empty paragraph carrying the first-page header's floating box.
+        if (preserveEmptyLine && paragraph.Inlines.Count == 0 && paragraph.List is null)
+            runs.Text(markCharPr, "&#160;");
 
         var sb = new StringBuilder();
         sb.Append($"<hp:p id=\"0\" paraPrIDRef=\"{paraPrId}\" styleIDRef=\"{styleId}\" pageBreak=\"{(paragraph.PageBreakBefore ? 1 : 0)}\" columnBreak=\"{(paragraph.ColumnBreakBefore ? 1 : 0)}\" merged=\"0\">");
@@ -375,8 +386,7 @@ internal sealed partial class HwpxWriter
 
         var (placed, columnCount) = PlaceCells(table);
 
-        var available = Math.Max(4000, _width - table.Indent);
-        var widths = ColumnWidths(table, columnCount, available);
+        var widths = ColumnWidths(table, columnCount, TableAvailableWidth(table));
         var totalWidth = widths.Sum();
         var rowHeights = EstimateRowHeights(table, placed, widths);
         var margin = table.CellMargin ?? new HInsets(510, 510, 141, 141);
@@ -447,6 +457,13 @@ internal sealed partial class HwpxWriter
         var paragraph = $"<hp:p id=\"0\" paraPrIDRef=\"{paraPrId}\" styleIDRef=\"{_base.StyleId}\" pageBreak=\"{(table.PageBreakBefore ? 1 : 0)}\" columnBreak=\"0\" merged=\"0\">{leadingRun}{runs.Finish(charPrId, leadingRun is not null)}{wrappedLine}</hp:p>";
         return paragraph + string.Concat(table.Caption.Select(b => Block(b)));
     }
+
+    // Absolute column widths of a table anchored to the paper can extend into the body margins.
+    private int TableAvailableWidth(HTable table) => Math.Max(4000,
+        table.ColumnWidths is { Length: > 0 } && table.Anchor is
+            { HorizontalRelativeTo: "PAPER", HorizontalAlign: "LEFT", HorizontalOffset: var x }
+            ? _paperWidth - x
+            : _width - table.Indent);
 
     /// <summary>
     /// Grid position of every cell: explicit cell columns (DOCX) or the next free position (Pandoc), skipping

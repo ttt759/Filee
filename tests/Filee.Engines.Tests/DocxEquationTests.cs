@@ -277,6 +277,9 @@ public class DocxEquationTests(EngineFixture fx) : IClassFixture<EngineFixture>
         var equals = page.Letters.Where(l => l.Value == "=").Select(l => l.StartBaseLine.Y).OrderDescending().ToArray();
         Assert.Equal(9, equals.Length);
         Assert.InRange(page.Height - equals[0], 72, 105);
+        var brace = Assert.Single(page.Paths.Select(path => path.GetBoundingRectangle())
+            .OfType<UglyToad.PdfPig.Core.PdfRectangle>(), bounds => bounds.Height > equals[0] - equals[^1] && bounds.Width is >= 3 and <= 6);
+        Assert.True(brace.Top > equals[0] && brace.Bottom < equals[^1]);
         Assert.Contains("Afterthesystem.", page.Text.Replace(" ", ""));
         var after = Assert.Single(page.Letters, l => l.Value == "A");
         Assert.True(after.StartBaseLine.Y < equals[^1]);

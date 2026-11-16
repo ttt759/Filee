@@ -150,6 +150,7 @@ internal sealed partial class HwpxWriter
                 HParagraph p when wrappedLines.Remove(i, out var line) => Paragraph(p, leadingRun, line),
                 HParagraph p when _forRhwpPdf && PicturesHaveClearSpace(p, blocks, i) =>
                     Paragraph(p, leadingRun, floatPicturesInFront: true),
+                HParagraph p when _forRhwpPdf => Paragraph(p, leadingRun, drawEquationBrace: true),
                 var block => Block(block, leadingRun),
             };
             body.Append(xml);
@@ -200,7 +201,8 @@ internal sealed partial class HwpxWriter
         _ => "",
     };
 
-    private string Paragraph(HParagraph paragraph, string? leadingRun, string? wrappedLine = null, bool floatPicturesInFront = false)
+    private string Paragraph(HParagraph paragraph, string? leadingRun, string? wrappedLine = null,
+        bool floatPicturesInFront = false, bool drawEquationBrace = false)
     {
         _plainText.AppendLine();
         var (styleId, paraPrBase, charPrBase) = paragraph.HeadingLevel > 0 && _headings.TryGetValue(paragraph.HeadingLevel, out var heading)
@@ -213,10 +215,11 @@ internal sealed partial class HwpxWriter
             runs.Control(_normalCharPrId, $"<hp:ctrl>{ColumnDefinition(columns)}</hp:ctrl>");
         var size = LargestSize(paragraph.Inlines) ?? paragraph.MarkFormat.Size ?? BaseSize(charPrBase);
         var tabs = new Queue<string>(TabElements(paragraph, size));
-        var equationLine = _forRhwpPdf ? EquationLine(paragraph, charPrBase) : null;
+        var equationLine = _forRhwpPdf ? EquationLine(paragraph, charPrBase, drawEquationBrace) : null;
         var markCharPr = CharPr(charPrBase, paragraph.MarkFormat);
         Inlines(paragraph.Inlines, runs, charPrBase, link: false, tabs, equationLine?.Height,
-            floatPicturesInFront, floatPicturesInFront && paragraph.Inlines.All(i => i is HImage) ? markCharPr : null);
+            floatPicturesInFront, floatPicturesInFront && paragraph.Inlines.All(i => i is HImage) ? markCharPr : null,
+            equationLine?.Brace);
 
         var sb = new StringBuilder();
         sb.Append($"<hp:p id=\"0\" paraPrIDRef=\"{paraPrId}\" styleIDRef=\"{styleId}\" pageBreak=\"{(paragraph.PageBreakBefore ? 1 : 0)}\" columnBreak=\"{(paragraph.ColumnBreakBefore ? 1 : 0)}\" merged=\"0\">");
@@ -299,14 +302,15 @@ internal sealed partial class HwpxWriter
 
     /// <param name="tabs">Pre-computed inline tab elements of the paragraph, in order (see TabElements).</param>
     private void Inlines(IEnumerable<HInline> inlines, RunBuilder runs, string charPrBase, bool link, Queue<string> tabs,
-        int? equationLineHeight = null, bool floatPicturesInFront = false, string? pictureCharPr = null)
+        int? equationLineHeight = null, bool floatPicturesInFront = false, string? pictureCharPr = null, string? equationBrace = null)
     {
         foreach (var inline in inlines)
         {
             switch (inline)
             {
                 case HEquation equation:
-                    runs.Control(CharPr(charPrBase, equation.Format, link), Equation(equation, charPrBase), isObject: true);
+                    runs.Control(CharPr(charPrBase, equation.Format, link),
+                        Equation(equation, charPrBase, equationBrace is not null) + equationBrace, isObject: true);
                     _plainText.Append(equation.Text);
                     break;
                 case HCachedPageField cached when _forRhwpPdf:

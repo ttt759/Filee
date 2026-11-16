@@ -95,7 +95,7 @@ internal sealed partial class HwpxWriter
     /// EquationScript), so it draws the equation unstretched; baseLine is where the text line runs, in percent of the
     /// height from the top.
     /// </summary>
-    private string Equation(HEquation equation, string charPrBase)
+    private string Equation(HEquation equation, string charPrBase, bool reserveBrace)
     {
         var size = Math.Max(100, equation.Format.Size ?? BaseSize(charPrBase));
         var (width, height, baseline) = EquationBox(equation, size);
@@ -103,6 +103,10 @@ internal sealed partial class HwpxWriter
         // HYhwpEQ requests Hancom's private-use glyphs in rhwp 0.9. Leave the font
         // unspecified in the PDF intermediate so the renderer uses ordinary math glyphs.
         var font = _forRhwpPdf ? "" : "HYhwpEQ";
+        // A normal equation space is as wide as the removed brace (0.33 em versus 0.333 em).
+        var math = reserveBrace && LeftBraceSystem(equation.Math) is { } brackets
+            ? brackets with { Left = "", Body = new MathRow([new MathSpace(), brackets.Body]) }
+            : equation.Math;
         return $"<hp:equation id=\"{id}\" zOrder=\"{_zOrder++}\" numberingType=\"EQUATION\" textWrap=\"TOP_AND_BOTTOM\" textFlow=\"BOTH_SIDES\" lock=\"0\" dropcapstyle=\"None\" " +
                $"version=\"Equation Version 60\" baseLine=\"{baseline}\" textColor=\"{equation.Format.Color ?? "#000000"}\" baseUnit=\"{size}\" lineMode=\"CHAR\" font=\"{font}\">" +
                $"<hp:sz width=\"{width}\" widthRelTo=\"ABSOLUTE\" height=\"{height}\" heightRelTo=\"ABSOLUTE\" protect=\"0\"/>" +
@@ -110,7 +114,7 @@ internal sealed partial class HwpxWriter
                // The comment (alternative text) is the linear form. Never an empty element: rhwp reads an empty
                // <hp:shapeComment/> of an equation up to the next closing tag and loses the rest of the section.
                $"<hp:outMargin left=\"{EquationMargin}\" right=\"{EquationMargin}\" top=\"0\" bottom=\"0\"/><hp:shapeComment>{Escape(equation.Text)}</hp:shapeComment>" +
-               $"<hp:script>{Escape(EquationScript.Script(equation.Math))}</hp:script></hp:equation>";
+               $"<hp:script>{Escape(EquationScript.Script(math))}</hp:script></hp:equation>";
     }
 
     private static (int Width, int Height, int BaselinePercent) EquationBox(HEquation equation, int size)
@@ -126,7 +130,7 @@ internal sealed partial class HwpxWriter
     /// rhwp uses a baseline at 85 % of the line height when there is no stored line. Match an equation-only line
     /// to the equation's own baseline so a tall system starts at the paragraph top and does not hang into the next one.
     /// </summary>
-    private (int Height, string Xml)? EquationLine(HParagraph paragraph, string charPrBase)
+    private (int Height, string Xml, string? Brace)? EquationLine(HParagraph paragraph, string charPrBase, bool drawBrace)
     {
         HEquation? equation = null;
         foreach (var inline in paragraph.Inlines)
@@ -162,7 +166,45 @@ internal sealed partial class HwpxWriter
         // First/last segment and the implementation flag: the metrics are synthesized
         // for rhwp, and vertpos=0 carries no saved page break.
         const uint lineFlags = 0x8006_0000;
-        return (height, $"<hp:linesegarray><hp:lineseg textpos=\"0\" vertpos=\"0\" vertsize=\"{height}\" textheight=\"{height}\" baseline=\"{baseline}\" spacing=\"{spacing}\" horzpos=\"0\" horzsize=\"{available}\" flags=\"{lineFlags}\"/></hp:linesegarray>");
+        var brace = drawBrace && paragraph.Format.Align == HAlign.Center && LeftBraceSystem(equation.Math) is not null
+            ? EquationBrace((paragraph.Format.Left ?? 0) + (available - width) / 2, height, size, equation.Format.Color)
+            : null;
+        return (height, $"<hp:linesegarray><hp:lineseg textpos=\"0\" vertpos=\"0\" vertsize=\"{height}\" textheight=\"{height}\" baseline=\"{baseline}\" spacing=\"{spacing}\" horzpos=\"0\" horzsize=\"{available}\" flags=\"{lineFlags}\"/></hp:linesegarray>", brace);
+    }
+
+    private static MathBrackets? LeftBraceSystem(MathNode math)
+    {
+        while (math is MathRow { Items: [var only] })
+            math = only;
+        return math is MathBrackets { Left: "{", Right: "", Body: MathPile } brackets ? brackets : null;
+    }
+
+    /// <summary>Draws a tall left brace with hooks of fixed length while the two stems follow the system's height.</summary>
+    private string EquationBrace(int x, int height, int size, string? color)
+    {
+        var id = NextId();
+        var width = size * 33 / 100;
+        var hook = size * 65 / 100;
+        var stem = width / 2;
+        var middle = height / 2;
+        var outer = width * 4 / 5;
+        var shoulder = width * 63 / 100;
+        (int X, int Y)[] points =
+        [
+            (width, 0), (outer, hook / 10), (shoulder, hook / 3), (stem, hook),
+            (stem, middle - hook), (width - shoulder, middle - hook / 3), (width - outer, middle - hook / 10),
+            (0, middle),
+            (width - outer, middle + hook / 10), (width - shoulder, middle + hook / 3), (stem, middle + hook),
+            (stem, height - hook), (shoulder, height - hook / 3), (outer, height - hook / 10), (width, height),
+        ];
+        var segments = string.Concat(points.Zip(points.Skip(1), (from, to) =>
+            $"<hp:seg type=\"LINE\" x1=\"{from.X}\" y1=\"{from.Y}\" x2=\"{to.X}\" y2=\"{to.Y}\"/>"));
+        var anchor = new HAnchor("COLUMN", "LEFT", x, "PARA", "TOP", 0, "IN_FRONT_OF_TEXT", true);
+        return $"<hp:curve id=\"{id}\" zOrder=\"{_zOrder++}\" numberingType=\"NONE\" textWrap=\"IN_FRONT_OF_TEXT\" textFlow=\"BOTH_SIDES\" lock=\"0\" href=\"\" groupLevel=\"0\" instid=\"{id}\">" +
+               $"<hp:offset x=\"0\" y=\"0\"/><hp:orgSz width=\"{width}\" height=\"{height}\"/><hp:curSz width=\"{width}\" height=\"{height}\"/>" +
+               $"<hp:lineShape color=\"{color ?? "#000000"}\" width=\"{Math.Max(1, size / 22)}\" style=\"SOLID\" endCap=\"ROUND\"/>" +
+               segments + $"<hp:sz width=\"{width}\" widthRelTo=\"ABSOLUTE\" height=\"{height}\" heightRelTo=\"ABSOLUTE\" protect=\"0\"/>" +
+               Position(anchor) + "<hp:outMargin left=\"0\" right=\"0\" top=\"0\" bottom=\"0\"/></hp:curve>";
     }
 
     /// <summary>hp:pos: inline objects are laid out like a character; floating ones use the anchor.</summary>

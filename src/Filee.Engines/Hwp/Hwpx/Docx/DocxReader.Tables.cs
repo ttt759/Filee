@@ -13,12 +13,21 @@ internal sealed partial class DocxReader
         var tblPr = tbl.Element(W + "tblPr");
         var style = _styles.GetValueOrDefault(Val(tblPr?.Element(W + "tblStyle")) ?? _defaultTableStyle ?? "");
         var styleChain = StyleChain(style);
+        var positioned = _tableDepth == 1 && _depth == 0 && _part.Xml.Root?.Name == W + "document" &&
+                         tblPr?.Element(W + "tblpPr") is { HasAttributes: true } position
+            ? position
+            : null;
 
         var grid = tbl.Element(W + "tblGrid")?.Elements(W + "gridCol").Select(c => HwpxUnits.FromTwips(Twips(c, "w") ?? 0)).ToArray() ?? [];
         var table = new HTable
         {
             ColumnWidths = grid.Length > 0 && grid.All(w => w > 0) ? grid : null,
             ColumnCount = grid.Length,
+            // An inline Word table is a body block of its own, without a wrapper paragraph or a bottom gap.
+            Tight = _tableDepth == 1 && _textBoxDepth == 0 && _part.Xml.Root?.Name == W + "document"
+                    && positioned is null,
+            WordAutoFit = Attr(tblPr?.Element(W + "tblW"), "type") is "auto"
+                          && Attr(tblPr?.Element(W + "tblLayout"), "type") != "fixed",
             Align = Val(tblPr?.Element(W + "jc")) switch
             {
                 "center" => HAlign.Center,
@@ -27,6 +36,14 @@ internal sealed partial class DocxReader
             },
             Indent = HwpxUnits.FromTwips(Twips(tblPr?.Element(W + "tblInd"), "w") ?? 0),
         };
+        if (positioned is not null)
+        {
+            table.Anchor = TableAnchor(positioned, Val(tblPr?.Element(W + "tblOverlap")) != "never");
+            table.OuterMargin = new HInsets(Clearance("leftFromText"), Clearance("rightFromText"),
+                Clearance("topFromText"), Clearance("bottomFromText"));
+        }
+
+        int Clearance(string name) => HwpxUnits.FromTwips(Math.Clamp(Twips(positioned, name) ?? 0, 0, 32767));
 
         // Borders and cell margins: table style chain, then the table's own properties.
         var borders = new Dictionary<string, HBorder>();
@@ -143,6 +160,28 @@ internal sealed partial class DocxReader
         return table;
 
         static int? CellSpacing(XElement? properties) => Twips(properties?.Element(W + "tblCellSpacing"), "w");
+    }
+
+    private static HAnchor TableAnchor(XElement position, bool allowOverlap)
+    {
+        // Word defaults to the column horizontally and the margin box vertically. Saved numeric positions
+        // include an extra twip so that a nominal zero does not trigger Word's inline-table fallback.
+        int Offset(string name) => HwpxUnits.FromTwips(Math.Max(0, Math.Clamp(Twips(position, name) ?? 0, 0, 32767) - 1));
+        return new HAnchor(
+            HorizontalRelativeTo: Attr(position, "horzAnchor") switch { "page" => "PAPER", "margin" => "PAGE", _ => "COLUMN" },
+            HorizontalAlign: Attr(position, "tblpXSpec") switch
+            {
+                "center" => "CENTER", "right" => "RIGHT", "inside" => "INSIDE", "outside" => "OUTSIDE", _ => "LEFT",
+            },
+            HorizontalOffset: Attr(position, "tblpXSpec") is null ? Offset("tblpX") : 0,
+            VerticalRelativeTo: Attr(position, "vertAnchor") switch { "page" => "PAPER", "text" => "PARA", _ => "PAGE" },
+            VerticalAlign: Attr(position, "tblpYSpec") switch
+            {
+                "center" => "CENTER", "bottom" => "BOTTOM", "inside" => "INSIDE", "outside" => "OUTSIDE", _ => "TOP",
+            },
+            VerticalOffset: Attr(position, "tblpYSpec") is null ? Offset("tblpY") : 0,
+            Wrap: "SQUARE",
+            AllowOverlap: allowOverlap);
     }
 
     /// <summary>

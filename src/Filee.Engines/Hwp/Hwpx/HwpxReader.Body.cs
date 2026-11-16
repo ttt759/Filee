@@ -502,7 +502,12 @@ internal sealed partial class HwpxReader
 
     private HTable Table(XElement tbl)
     {
-        var table = new HTable { ColumnCount = Math.Max(0, Int(tbl, "colCnt")) };
+        var table = new HTable
+        {
+            ColumnCount = Math.Max(0, Int(tbl, "colCnt")),
+            Tight = Child(tbl, "outMargin") is { } outerMargin && Int(outerMargin, "bottom") == 0
+                    && CharFormat(Attr(tbl.Parent, "charPrIDRef")).Size == 100,
+        };
         var pos = Child(tbl, "pos");
         if (pos is not null && !Flag(pos, "treatAsChar"))
         {

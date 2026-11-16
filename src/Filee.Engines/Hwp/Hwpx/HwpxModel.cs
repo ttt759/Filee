@@ -130,6 +130,11 @@ internal sealed class HTable : HBlock
     public HAlign Align { get; set; } = HAlign.Left;
     public int Indent { get; set; }
 
+    /// <summary>Position and text clearance of a floating table.</summary>
+    public HAnchor? Anchor { get; set; }
+    public HInsets OuterMargin { get; set; }
+    public bool WordAutoFit { get; set; }
+
     /// <summary>Cell padding; null = 한글 default.</summary>
     public HInsets? CellMargin { get; set; }
 
@@ -259,6 +264,13 @@ internal enum HFieldKind
 {
     PageNumber,
     TotalPages,
+    SectionPages,
+}
+
+/// <summary>A first-page header table field with the text Word last saved for it.</summary>
+internal sealed class HCachedPageField(string text, HCharFormat format, HFieldKind kind) : HText(text, format)
+{
+    public HFieldKind Kind { get; } = kind;
 }
 
 /// <summary>Automatic number (page number in headers and footers).</summary>
@@ -287,6 +299,7 @@ internal sealed class HTextBox : HInline
     public int Width { get; set; }
     public int Height { get; set; }
     public HAnchor? Anchor { get; set; }
+    public bool IsEquationNumber { get; init; }
     public string? Fill { get; set; }
     public HGradient? Gradient { get; set; }
     public HBorder Line { get; set; } = HBorder.Thin;

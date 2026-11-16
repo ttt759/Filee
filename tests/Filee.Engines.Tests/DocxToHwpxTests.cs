@@ -5,6 +5,8 @@
 using System.Xml.Linq;
 using Filee.Core.Conversion;
 using Filee.Core.Presets;
+using Filee.Engines.Hwp.Hwpx;
+using Filee.Engines.Hwp.Hwpx.Docx;
 using ImageMagick;
 using static Filee.Engines.Tests.DocxBuilder;
 using static Filee.Engines.Tests.HwpxAssert;
@@ -117,6 +119,44 @@ public class DocxToHwpxTests(EngineFixture fx) : IClassFixture<EngineFixture>
         Assert.Equal((100 * 5, 0), Gaps("목록 하나"));
         Assert.Equal((0, 0), Gaps("목록 둘"));
         Assert.Equal((0, 200 * 5), Gaps("목록 셋"));
+    }
+
+    [Fact]
+    public async Task Adjacent_word_paragraphs_use_the_larger_gap()
+    {
+        var docx = new DocxBuilder()
+            .Paragraph(P(R("First line"), """<w:spacing w:after="480"/>"""))
+            .Paragraph(P(R("Second line"), """<w:spacing w:before="480" w:after="240"/>"""))
+            .Paragraph(P(R("Third line"), """<w:spacing w:before="480"/>"""));
+        var hwpx = await ConvertAsync(docx, "collapsed-paragraph-spacing");
+        var section = Xml(hwpx);
+        var header = Xml(hwpx, "Contents/header.xml");
+        (int Before, int After) Spacing(string text)
+        {
+            var id = (string?)ParagraphWith(section, text).Attribute("paraPrIDRef");
+            var paraPr = header.Descendants(Hh + "paraPr").Single(p => (string?)p.Attribute("id") == id);
+            var margin = paraPr.Descendants(Hp + "case").Single().Descendants(Hh + "margin").Single();
+            return (Int(margin.Element(Hc + "prev")!, "value"), Int(margin.Element(Hc + "next")!, "value"));
+        }
+
+        Assert.Equal(2400, Spacing("First line").After + Spacing("Second line").Before);
+        Assert.Equal(2400, Spacing("Second line").After + Spacing("Third line").Before);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_word_run_page_break_does_not_insert_an_empty_line_at_the_top(bool standalone)
+    {
+        const string pageBreak = """<w:r><w:br w:type="page"/></w:r>""";
+        var first = standalone ? P(R("Previous page")) + P(pageBreak) : P(R("Previous page") + pageBreak);
+        var docx = new DocxBuilder().Paragraph(first)
+            .Paragraph(P(R("New chapter"), """<w:spacing w:before="480"/>"""));
+        var hwpx = await ConvertAsync(docx, "page-break-gap");
+        var section = Xml(hwpx);
+        var chapter = ParagraphWith(section, "New chapter");
+        Assert.Equal("1", (string?)chapter.Attribute("pageBreak"));
+        Assert.Single(section.Descendants(Hp + "p"), p => (string?)p.Attribute("pageBreak") == "1");
     }
 
     [Fact]
@@ -259,6 +299,23 @@ public class DocxToHwpxTests(EngineFixture fx) : IClassFixture<EngineFixture>
     }
 
     [Fact]
+    public async Task Inline_word_table_does_not_add_a_body_paragraph_gap()
+    {
+        var docx = new DocxBuilder()
+            .Paragraph(P(R("Before table")))
+            .Paragraph($"<w:tbl><w:tr><w:tc>{P(R("One cell"))}</w:tc></w:tr></w:tbl>")
+            .Paragraph(P(R("After table")));
+        var hwpx = await ConvertAsync(docx, "inline-table-gap");
+        var table = Assert.Single(Xml(hwpx).Descendants(Hp + "tbl"));
+        var run = table.Parent!;
+        var header = Xml(hwpx, "Contents/header.xml");
+        var charId = (string?)run.Attribute("charPrIDRef");
+        var charPr = header.Descendants(Hh + "charPr").Single(p => (string?)p.Attribute("id") == charId);
+        Assert.Equal(0, Int(table.Element(Hp + "outMargin")!, "bottom"));
+        Assert.Equal(100, Int(charPr, "height"));
+    }
+
+    [Fact]
     public async Task Numeric_ranges_that_fit_the_cell_do_not_reserve_a_second_line()
     {
         const string face = "Times New Roman";
@@ -329,6 +386,30 @@ public class DocxToHwpxTests(EngineFixture fx) : IClassFixture<EngineFixture>
         Assert.Equal("SOLID", (string?)cells.Single(c => c.Text == "A").BorderFill.Element(Hh + "leftBorder")!.Attribute("type"));
         Assert.Equal("#FFF2CC", (string?)cells.Single(c => c.Text == "D").BorderFill.Descendants(Hc + "winBrush").Single().Attribute("faceColor"));
         RenderWithRhwp(fx, hwpx, "docx-table");
+    }
+
+    [Fact]
+    public async Task A_right_tab_accounts_for_the_inline_image_before_it()
+    {
+        var docx = new DocxBuilder();
+        using var image = new MagickImage(MagickColors.Black, 10, 10);
+        var picture = docx.Image(image.ToByteArray(MagickFormat.Png));
+        const string tabStop = """<w:tabs><w:tab w:val="right" w:pos="7200"/></w:tabs>""";
+        const string tab = "<w:r><w:tab/></w:r>";
+        docx.Paragraph(P(R("Signed") + tab + R("2026"), tabStop));
+        docx.Paragraph(P(R("Signed") + InlinePicture(picture, 254000, 127000) + tab + R("2026"), tabStop));
+
+        var hwpx = await ConvertAsync(docx, "tab-after-inline-image", expectImages: 1);
+        var tabs = Xml(hwpx).Descendants(Hp + "tab").ToArray();
+        Assert.Equal(2, tabs.Length);
+        Assert.Equal(2000, Int(tabs[0], "width") - Int(tabs[1], "width"));
+        Assert.All(tabs, t => Assert.Equal(2, Int(t, "type")));
+
+        var folder = fx.NewFolder();
+        var source = docx.Save(Path.Combine(folder, "source.docx"));
+        var renderInput = Path.Combine(folder, "pdf-input.hwpx");
+        HwpxWriter.Write(DocxReader.Read(source, Path.Combine(folder, "media")), renderInput, forRhwpPdf: true);
+        Assert.Equal([2, 1], Xml(renderInput).Descendants(Hp + "tab").Select(t => Int(t, "type")));
     }
 
     [Fact]

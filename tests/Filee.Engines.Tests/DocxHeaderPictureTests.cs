@@ -23,17 +23,20 @@ public class DocxHeaderPictureTests(EngineFixture fx) : IClassFixture<EngineFixt
         "<wp:positionH relativeFrom=\"page\"><wp:posOffset>914400</wp:posOffset></wp:positionH>",
         "<wp:positionV relativeFrom=\"page\"><wp:posOffset>200000</wp:posOffset></wp:positionV>", "<wp:wrapNone/>");
 
-    private async Task<string> PdfAsync(string header)
+    private async Task<string> PdfAsync(string header, bool firstPage = false)
     {
         var rhwp = fx.Converters.Single(c => c.Id == "rhwp");
         Assert.SkipUnless(fx.Catalog.StatusOf(rhwp).IsAvailable, "rhwp not found (pwsh build/fetch-engines.ps1 -Only rhwp)");
 
         var docx = new DocxBuilder().Paragraph(P(R("Body")));
-        docx.SectionProperties = $"<w:headerReference w:type=\"default\" r:id=\"{docx.Header(header)}\"/>{DefaultPage}";
+        var type = firstPage ? "first" : "default";
+        var titlePage = firstPage ? "<w:titlePg/>" : "";
+        docx.SectionProperties = $"<w:headerReference w:type=\"{type}\" r:id=\"{docx.Header(header)}\"/>{DefaultPage}{titlePage}";
         var path = docx.Save(Path.Combine(fx.NewFolder(), "source.docx"));
         AddHeaderPicture(path);
 
-        var job = await fx.ConvertAsync([path], new Preset { TargetFormat = "pdf" });
+        var catalog = new ConverterCatalog(fx.Converters.Where(c => c.Id is "hwpx-writer" or "rhwp"));
+        var job = await fx.ConvertAsync([path], new Preset { TargetFormat = "pdf" }, catalog);
         Assert.True(job.State == JobState.Completed, string.Join("; ", job.Files.Select(f => $"{f.ErrorKey} {f.ErrorDetail}")));
         return job.Outputs.Single();
     }
@@ -75,8 +78,26 @@ public class DocxHeaderPictureTests(EngineFixture fx) : IClassFixture<EngineFixt
         using var document = PdfDocument.Open(await PdfAsync(P(FloatingPicture())));
 
         var page = document.GetPage(1);
-        var bounds = Assert.Single(page.GetImages()).Bounds;
+        var bounds = Assert.Single(page.GetImages()).BoundingBox;
         Assert.InRange(bounds.Left, 71, 73);
         Assert.InRange(page.Height - bounds.Top, 15, 17);
+    }
+
+    [Fact]
+    public async Task A_logo_in_a_first_page_header_cell_keeps_its_offsets_after_a_blank_paragraph()
+    {
+        const long logoWidth = 720000, logoHeight = 240000;
+        var logo = Anchor(PictureUri, Picture(PictureId, logoWidth, logoHeight), logoWidth, logoHeight,
+            "<wp:positionH relativeFrom=\"column\"><wp:posOffset>139700</wp:posOffset></wp:positionH>",
+            "<wp:positionV relativeFrom=\"paragraph\"><wp:posOffset>101600</wp:posOffset></wp:positionV>", "<wp:wrapNone/>");
+        var blank = P("", "<w:spacing w:line=\"240\" w:lineRule=\"exact\"/>");
+        var table = Table.Replace("<w:r><w:t>Classification</w:t></w:r>", logo, StringComparison.Ordinal)
+            .Replace("<w:tr>", "<w:tr><w:trPr><w:trHeight w:val=\"800\" w:hRule=\"atLeast\"/></w:trPr>", StringComparison.Ordinal);
+        using var document = PdfDocument.Open(await PdfAsync(blank + table, firstPage: true));
+
+        var page = document.GetPage(1);
+        var bounds = Assert.Single(page.GetImages()).BoundingBox;
+        Assert.InRange(bounds.Left, 87.5, 89.5); // 72 pt margin + 5.1 pt cell inset + 11 pt anchor offset
+        Assert.InRange(page.Height - bounds.Top, 55, 58); // 36 pt header distance + 12 pt line + 8 pt anchor offset
     }
 }

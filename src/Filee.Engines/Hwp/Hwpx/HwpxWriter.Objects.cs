@@ -20,7 +20,7 @@ internal sealed partial class HwpxWriter
 
     // ───────────────────────── Pictures ─────────────────────────
 
-    private string? Picture(HImage image)
+    private string? Picture(HImage image, bool floatInFront)
     {
         if (!File.Exists(image.Path))
             return null; // missing image: skip rather than produce a broken reference
@@ -68,7 +68,7 @@ internal sealed partial class HwpxWriter
             _images.Add((binaryId, image.Path, extension));
 
         var id = NextId();
-        var wrap = image.Anchor?.Wrap ?? "TOP_AND_BOTTOM";
+        var wrap = floatInFront ? "IN_FRONT_OF_TEXT" : image.Anchor?.Wrap ?? "TOP_AND_BOTTOM";
         return $"<hp:pic id=\"{id}\" zOrder=\"{_zOrder++}\" numberingType=\"{(image.Anchor is null ? "NONE" : "PICTURE")}\" textWrap=\"{wrap}\" textFlow=\"BOTH_SIDES\" lock=\"0\" dropcapstyle=\"None\" href=\"\" groupLevel=\"0\" instid=\"{id}\" reverse=\"0\">" +
                "<hp:offset x=\"0\" y=\"0\"/>" +
                $"<hp:orgSz width=\"{w}\" height=\"{h}\"/><hp:curSz width=\"{w}\" height=\"{h}\"/>" +
@@ -98,19 +98,71 @@ internal sealed partial class HwpxWriter
     private string Equation(HEquation equation, string charPrBase)
     {
         var size = Math.Max(100, equation.Format.Size ?? BaseSize(charPrBase));
-        var box = EquationScript.Measure(equation.Math, size);
-        var width = Math.Max(1, (int)Math.Ceiling(box.Width));
-        var height = Math.Max(1, (int)Math.Ceiling(box.Height));
-        var baseline = box.Height > 0 ? Math.Clamp((int)Math.Round(box.Baseline * 100 / box.Height), 0, 100) : 85;
+        var (width, height, baseline) = EquationBox(equation, size);
         var id = NextId();
+        // HYhwpEQ requests Hancom's private-use glyphs in rhwp 0.9. Leave the font
+        // unspecified in the PDF intermediate so the renderer uses ordinary math glyphs.
+        var font = _forRhwpPdf ? "" : "HYhwpEQ";
         return $"<hp:equation id=\"{id}\" zOrder=\"{_zOrder++}\" numberingType=\"EQUATION\" textWrap=\"TOP_AND_BOTTOM\" textFlow=\"BOTH_SIDES\" lock=\"0\" dropcapstyle=\"None\" " +
-               $"version=\"Equation Version 60\" baseLine=\"{baseline}\" textColor=\"{equation.Format.Color ?? "#000000"}\" baseUnit=\"{size}\" lineMode=\"CHAR\" font=\"HYhwpEQ\">" +
+               $"version=\"Equation Version 60\" baseLine=\"{baseline}\" textColor=\"{equation.Format.Color ?? "#000000"}\" baseUnit=\"{size}\" lineMode=\"CHAR\" font=\"{font}\">" +
                $"<hp:sz width=\"{width}\" widthRelTo=\"ABSOLUTE\" height=\"{height}\" heightRelTo=\"ABSOLUTE\" protect=\"0\"/>" +
                Position(null) +
                // The comment (alternative text) is the linear form. Never an empty element: rhwp reads an empty
                // <hp:shapeComment/> of an equation up to the next closing tag and loses the rest of the section.
                $"<hp:outMargin left=\"{EquationMargin}\" right=\"{EquationMargin}\" top=\"0\" bottom=\"0\"/><hp:shapeComment>{Escape(equation.Text)}</hp:shapeComment>" +
                $"<hp:script>{Escape(EquationScript.Script(equation.Math))}</hp:script></hp:equation>";
+    }
+
+    private static (int Width, int Height, int BaselinePercent) EquationBox(HEquation equation, int size)
+    {
+        var box = EquationScript.Measure(equation.Math, size);
+        var width = Math.Max(1, (int)Math.Ceiling(box.Width));
+        var height = Math.Max(1, (int)Math.Ceiling(box.Height));
+        var baseline = box.Height > 0 ? Math.Clamp((int)Math.Round(box.Baseline * 100 / box.Height), 0, 100) : 85;
+        return (width, height, baseline);
+    }
+
+    /// <summary>
+    /// rhwp uses a baseline at 85 % of the line height when there is no stored line. Match an equation-only line
+    /// to the equation's own baseline so a tall system starts at the paragraph top and does not hang into the next one.
+    /// </summary>
+    private (int Height, string Xml)? EquationLine(HParagraph paragraph, string charPrBase)
+    {
+        HEquation? equation = null;
+        foreach (var inline in paragraph.Inlines)
+        {
+            switch (inline)
+            {
+                case HEquation item when equation is null:
+                    equation = item;
+                    break;
+                case HBookmark or HTextBox { IsEquationNumber: true }:
+                    break;
+                default:
+                    return null;
+            }
+        }
+        if (equation is null || paragraph.List is not null)
+            return null;
+
+        var size = Math.Max(100, equation.Format.Size ?? BaseSize(charPrBase));
+        var (width, height, baselinePercent) = EquationBox(equation, size);
+        var available = _width - (paragraph.Format.Left ?? 0) - (paragraph.Format.Right ?? 0) - (paragraph.Format.FirstLine ?? 0);
+        var baseline = (int)Math.Round(height * (baselinePercent / 100.0));
+        // Small overhangs already fit with RhwpInput's ordinary spacing adjustment. A tall
+        // equation that extends a full em past its line leaves a visible gap at the paragraph top.
+        if (width + 2 * EquationMargin > available || height * 0.85 - baseline < size)
+            return null;
+        var spacing = paragraph.Format.LineSpacing switch
+        {
+            { Kind: HLineSpacingKind.Percent, Value: > 100 } percent => (int)Math.Round(size * ((percent.Value - 100) / 100.0)),
+            { Kind: HLineSpacingKind.Fixed or HLineSpacingKind.AtLeast } minimum => Math.Max(0, minimum.Value - height),
+            _ => 0,
+        };
+        // First/last segment and the implementation flag: the metrics are synthesized
+        // for rhwp, and vertpos=0 carries no saved page break.
+        const uint lineFlags = 0x8006_0000;
+        return (height, $"<hp:linesegarray><hp:lineseg textpos=\"0\" vertpos=\"0\" vertsize=\"{height}\" textheight=\"{height}\" baseline=\"{baseline}\" spacing=\"{spacing}\" horzpos=\"0\" horzsize=\"{available}\" flags=\"{lineFlags}\"/></hp:linesegarray>");
     }
 
     /// <summary>hp:pos: inline objects are laid out like a character; floating ones use the anchor.</summary>
@@ -149,8 +201,9 @@ internal sealed partial class HwpxWriter
 
     // ───────────────────────── Text boxes ─────────────────────────
 
-    private string TextBox(HTextBox box)
+    private string TextBox(HTextBox box, string name = "", HAnchor? anchorOverride = null)
     {
+        var anchor = anchorOverride ?? box.Anchor;
         var id = NextId();
         var (w, h) = (box.Width, box.Height);
         var verticalAlign = box.VerticalAlign switch
@@ -171,7 +224,7 @@ internal sealed partial class HwpxWriter
             ? ("ellipse", " intervalDirty=\"0\" hasArcPr=\"0\" arcType=\"NORMAL\"")
             : ("rect", $" ratio=\"{box.CornerRatio}\"");
         var sb = new StringBuilder();
-        sb.Append($"<hp:{element} id=\"{id}\" zOrder=\"{_zOrder++}\" numberingType=\"NONE\" textWrap=\"{box.Anchor?.Wrap ?? "TOP_AND_BOTTOM"}\" textFlow=\"BOTH_SIDES\" lock=\"0\" dropcapstyle=\"None\" href=\"\" groupLevel=\"0\" instid=\"{id}\"{extra}>");
+        sb.Append($"<hp:{element} id=\"{id}\" zOrder=\"{_zOrder++}\" numberingType=\"NONE\" textWrap=\"{anchor?.Wrap ?? "TOP_AND_BOTTOM"}\" textFlow=\"BOTH_SIDES\" lock=\"0\" dropcapstyle=\"None\" href=\"\" groupLevel=\"0\" instid=\"{id}\"{extra}>");
         sb.Append("<hp:offset x=\"0\" y=\"0\"/>");
         sb.Append($"<hp:orgSz width=\"{w}\" height=\"{h}\"/><hp:curSz width=\"0\" height=\"0\"/>");
         sb.Append("<hp:flip horizontal=\"0\" vertical=\"0\"/>");
@@ -180,13 +233,13 @@ internal sealed partial class HwpxWriter
         sb.Append(LineShape(box.Line));
         sb.Append(FillBrush(box.Fill, box.Gradient));
         sb.Append("<hp:shadow type=\"NONE\" color=\"#B2B2B2\" offsetX=\"0\" offsetY=\"0\" alpha=\"0\"/>");
-        sb.Append($"<hp:drawText lastWidth=\"{w}\" name=\"\" editable=\"0\">");
+        sb.Append($"<hp:drawText lastWidth=\"{w}\" name=\"{name}\" editable=\"0\">");
         sb.Append(content);
         sb.Append($"<hp:textMargin left=\"{box.Padding.Left}\" right=\"{box.Padding.Right}\" top=\"{box.Padding.Top}\" bottom=\"{box.Padding.Bottom}\"/>");
         sb.Append("</hp:drawText>");
         sb.Append(ellipse ? EllipseGeometry(w, h) : RectangleGeometry(w, h));
         sb.Append($"<hp:sz width=\"{w}\" widthRelTo=\"ABSOLUTE\" height=\"{h}\" heightRelTo=\"ABSOLUTE\" protect=\"0\"/>");
-        sb.Append(Position(box.Anchor));
+        sb.Append(Position(anchor));
         sb.Append("<hp:outMargin left=\"0\" right=\"0\" top=\"0\" bottom=\"0\"/>");
         sb.Append($"</hp:{element}>");
         return sb.ToString();

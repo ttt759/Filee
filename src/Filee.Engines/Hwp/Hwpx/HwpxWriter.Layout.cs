@@ -40,7 +40,7 @@ internal sealed partial class HwpxWriter
     }
 
     /// <summary>Estimated height of blocks laid out in <paramref name="width"/>.</summary>
-    private int EstimateHeight(IEnumerable<HBlock> blocks, int width)
+    private int EstimateHeight(IEnumerable<HBlock> blocks, int width, bool measureStyledLatin = false)
     {
         var total = 0;
         foreach (var block in blocks)
@@ -48,7 +48,7 @@ internal sealed partial class HwpxWriter
             switch (block)
             {
                 case HParagraph paragraph:
-                    total += EstimateHeight(paragraph, width);
+                    total += EstimateHeight(paragraph, width, measureStyledLatin);
                     break;
                 case HTable table:
                     {
@@ -61,17 +61,11 @@ internal sealed partial class HwpxWriter
         return total;
     }
 
-    private int EstimateHeight(HParagraph paragraph, int width)
+    private int EstimateHeight(HParagraph paragraph, int width, bool measureStyledLatin = false)
     {
         var (_, paraPrBase, charPrBase) = paragraph.HeadingLevel > 0 && _headings.TryGetValue(paragraph.HeadingLevel, out var heading) ? heading : _base;
         var size = LargestSize(paragraph.Inlines) ?? paragraph.MarkFormat.Size ?? BaseSize(charPrBase);
-        var line = paragraph.Format.LineSpacing switch
-        {
-            { Kind: HLineSpacingKind.Fixed } fixedLine => fixedLine.Value,
-            { Kind: HLineSpacingKind.AtLeast } atLeast => Math.Max(atLeast.Value, size * 13 / 10),
-            { Kind: HLineSpacingKind.Percent } percent => size * percent.Value / 100,
-            _ => size * BasePercent(paraPrBase) / 100,
-        };
+        var line = LineHeight(paragraph, size, paraPrBase);
         var available = Math.Max(1000, width - (paragraph.Format.Left ?? 0) - (paragraph.Format.Right ?? 0));
 
         // Line breaks split the text; each piece wraps on its own. Objects add their own height.
@@ -85,7 +79,7 @@ internal sealed partial class HwpxWriter
                 switch (inline)
                 {
                     case HText text:
-                        current += EstimateRunWidth(text, text.Format.Size ?? size);
+                        current += EstimateRunWidth(text, text.Format.Size ?? size, measureStyledLatin);
                         break;
                     case HTab:
                         current += 4000;
@@ -111,12 +105,20 @@ internal sealed partial class HwpxWriter
         return lines * line + objects + (paragraph.Format.Before ?? 0) + (paragraph.Format.After ?? 0);
     }
 
-    private static double EstimateRunWidth(HText run, int size)
+    private int LineHeight(HParagraph paragraph, int size, string paraPrBase) => paragraph.Format.LineSpacing switch
+    {
+        { Kind: HLineSpacingKind.Fixed } fixedLine => fixedLine.Value,
+        { Kind: HLineSpacingKind.AtLeast } atLeast => Math.Max(atLeast.Value, size * 13 / 10),
+        { Kind: HLineSpacingKind.Percent } percent => size * percent.Value / 100,
+        _ => size * BasePercent(paraPrBase) / 100,
+    };
+
+    private static double EstimateRunWidth(HText run, int size, bool measureStyledLatin = false)
     {
         // Plain Latin runs can use the advances of the named font. Other scripts may be drawn
         // from different HWPX font slots, so keep their existing estimate.
         var format = run.Format;
-        if (format.Font is not { } face || format.Bold == true || format.Italic == true
+        if (format.Font is not { } face || !measureStyledLatin && (format.Bold == true || format.Italic == true)
             || format.Spacing is not (null or 0) || format.Superscript == true || format.Subscript == true
             || !run.Text.All(c => c is >= ' ' and <= '~' or '\u00A0' or '\u2013' or '\u2014')
             || RhwpFonts.Find(face) is not { Usable: true, Advance: { } advance })
@@ -174,7 +176,8 @@ internal sealed partial class HwpxWriter
                     var width = 0;
                     for (var i = column; i < column + cell.ColSpan && i < widths.Length; i++)
                         width += widths[i];
-                    var needed = EstimateHeight(cell.Blocks.Count > 0 ? cell.Blocks : [new HParagraph()], Math.Max(1000, width - cellMargin.Left - cellMargin.Right))
+                    var needed = EstimateHeight(cell.Blocks.Count > 0 ? cell.Blocks : [new HParagraph()],
+                                     Math.Max(1000, width - cellMargin.Left - cellMargin.Right), measureStyledLatin: table.Anchor is not null)
                                  + cellMargin.Top + cellMargin.Bottom;
                     // A collapsed Word table border is centered on the row edge. Each cell accounts for half
                     // of its top and bottom strokes so a shared border does not add its full width twice.
@@ -204,7 +207,7 @@ internal sealed partial class HwpxWriter
     /// Type, leader and width of each inline tab of a paragraph, in order. Like 한글 and Word, a tab moves to the
     /// first tab stop right of the text before it; without a stop it advances to the next default stop.
     /// </summary>
-    private static List<string> TabElements(HParagraph paragraph, int size)
+    private List<string> TabElements(HParagraph paragraph, int size)
     {
         var result = new List<string>();
         var stops = paragraph.Format.Tabs ?? [];
@@ -223,12 +226,14 @@ internal sealed partial class HwpxWriter
                         // An equation is as wide as its box and margins (a centred display equation between tabs).
                         HEquation equation => EquationScript.Measure(equation.Math, equation.Format.Size ?? size).Width + 2 * EquationMargin,
                         HText text => TextWidth(text.Text, text.Format.Size ?? size),
+                        HImage { Anchor: null, Width: { } width } => width,
                         _ => 0,
                     }));
             }
         }
         Flatten(paragraph.Inlines);
 
+        var hasInlinePicture = false;
         for (var i = 0; i < pieces.Count; i++)
         {
             switch (pieces[i].Inline)
@@ -236,8 +241,13 @@ internal sealed partial class HwpxWriter
                 case HText:
                     x += pieces[i].Width;
                     break;
+                case HImage { Anchor: null }:
+                    x += pieces[i].Width;
+                    hasInlinePicture = true;
+                    break;
                 case HLineBreak:
                     x = left;
+                    hasInlinePicture = false;
                     break;
                 case HTab:
                     {
@@ -272,6 +282,10 @@ internal sealed partial class HwpxWriter
                             (type, leader, target) = (1, 0, (Math.Floor(x / DefaultStop) + 1) * DefaultStop);
                         }
                         var width = Math.Max(0, (int)(target - x));
+                        // rhwp can reorder the runs after a right tab when an inline picture precedes it.
+                        // The computed width already places the runs at the right stop.
+                        if (_forRhwpPdf && type == 2 && leader == 0 && hasInlinePicture)
+                            type = 1;
                         result.Add($"<hp:tab width=\"{width}\" leader=\"{leader}\" type=\"{type}\"/>");
                         x += width;
                         break;

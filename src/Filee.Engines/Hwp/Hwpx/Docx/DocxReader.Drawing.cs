@@ -3,7 +3,9 @@
 
 using System.Globalization;
 using System.Xml.Linq;
+using Filee.Engines.Vector;
 using ImageMagick;
+using SkiaSharp;
 
 namespace Filee.Engines.Hwp.Hwpx.Docx;
 
@@ -16,6 +18,63 @@ internal sealed partial class DocxReader
     private static readonly HInsets DefaultTextBoxPadding = new(720, 720, 360, 360);
 
     private readonly Dictionary<string, string> _themeColors = [];
+    private readonly Dictionary<HParagraph, XElement> _frameProperties = [];
+
+    /// <summary>A fixed-size paragraph frame carries its text and inline graphics together at a floating position.</summary>
+    private bool TryReadFrame(XElement paragraph, List<HBlock> output)
+    {
+        var pPr = paragraph.Element(W + "pPr");
+        var frame = pPr?.Element(W + "framePr");
+        if (frame is null || pPr!.Element(W + "sectPr") is not null || Attr(frame, "dropCap") is "drop" or "margin"
+            || Twips(frame, "w") is not { } width || width <= 0 || Twips(frame, "h") is not { } height || height <= 0
+            || Twips(frame, "x") is not { } x || Twips(frame, "y") is not { } y)
+            return false;
+
+        if (output.LastOrDefault() is HParagraph previous && _frameProperties.TryGetValue(previous, out var properties)
+            && XNode.DeepEquals(properties, frame) && previous.Inlines is [HTextBox existing])
+        {
+            ReadParagraph(paragraph, existing.Blocks);
+            return true;
+        }
+
+        var anchor = new HAnchor(
+            RelativeTo(Attr(frame, "hAnchor"), "COLUMN"), "LEFT", HwpxUnits.FromTwips(x),
+            RelativeTo(Attr(frame, "vAnchor"), "PARA"), "TOP", HwpxUnits.FromTwips(y),
+            Attr(frame, "wrap") switch
+            {
+                "around" or "auto" or "tight" or "through" => "SQUARE",
+                "notBeside" => "TOP_AND_BOTTOM",
+                _ => "IN_FRONT_OF_TEXT",
+            }, true);
+        var box = new TextBoxBuilder(HwpxUnits.FromTwips(width), HwpxUnits.FromTwips(height), anchor)
+        {
+            Line = HBorder.None,
+            Padding = new HInsets(0, 0, 0, 0),
+        }.Build();
+        ReadParagraph(paragraph, box.Blocks);
+
+        // The empty anchor stays in the body. The content and its line spacing belong to the frame.
+        var first = (HParagraph)box.Blocks[0];
+        var carrier = new HParagraph
+        {
+            PageBreakBefore = first.PageBreakBefore,
+            ColumnBreakBefore = first.ColumnBreakBefore,
+            Format = new HParaFormat(Before: 0, After: 0, LineSpacing: new HLineSpacing(HLineSpacingKind.Fixed, 1)),
+        };
+        first.PageBreakBefore = false;
+        first.ColumnBreakBefore = false;
+        carrier.Inlines.Add(box);
+        _frameProperties[carrier] = frame;
+        output.Add(carrier);
+        return true;
+
+        static string RelativeTo(string? value, string fallback) => value switch
+        {
+            "page" => "PAPER",
+            "margin" => "PAGE",
+            _ => fallback,
+        };
+    }
 
     private IEnumerable<HInline> Drawing(XElement drawing)
     {
@@ -431,6 +490,8 @@ internal sealed partial class DocxReader
                 continue;
 
             var style = VmlStyle((string?)shape.Attribute("style"));
+            if (style.GetValueOrDefault("visibility") == "hidden")
+                continue;
             var width = HwpxUnits.ParseLength(style.GetValueOrDefault("width")) ?? 0;
             var height = HwpxUnits.ParseLength(style.GetValueOrDefault("height")) ?? 0;
             var anchor = style.GetValueOrDefault("position") == "absolute" ? VmlAnchor(shape, style) : null;
@@ -454,6 +515,10 @@ internal sealed partial class DocxReader
                 if (anchor is null)
                 {
                     yield return text;
+                }
+                else if (anchor.Wrap == "BEHIND_TEXT" && WordArtWatermark(shape, style, text, width, height, anchor) is { } watermark)
+                {
+                    yield return watermark;
                 }
                 else
                 {
@@ -511,8 +576,11 @@ internal sealed partial class DocxReader
         if (path is null || (string?)path.Attribute("on") is "f" or "false" || string.IsNullOrWhiteSpace(text))
             return null;
 
+        // An empty move followed by an empty line has no baseline for Word to draw the text on.
+        if (Attr(shape, "path")?.StartsWith("m,l,", StringComparison.Ordinal) == true)
+            return null;
         var font = VmlStyle((string?)path.Attribute("style"));
-        var family = font.GetValueOrDefault("font-family")?.Trim('"', '\'', ' ');
+        var family = font.GetValueOrDefault("font-family")?.Split(',', 2)[0].Trim('"', '\'', ' ');
         var size = HwpxUnits.ParseLength(font.GetValueOrDefault("font-size")) is { } points and > 0 ? points : format.Size ?? 1000;
         var stretched = (string?)path.Attribute("fitpath") is "t" or "true" || (string?)path.Attribute("fitshape") is "t" or "true";
         if (stretched && width > 0 && height > 0)
@@ -536,6 +604,86 @@ internal sealed partial class DocxReader
             Italic = font.GetValueOrDefault("font-style") is { } italic ? italic == "italic" : format.Italic,
             Color = color ?? format.Color,
         });
+    }
+
+    /// <summary>
+    /// Draws a watermark as a translucent graphic. HWPX readers may rotate the outline of a text box and leave its
+    /// text horizontal. The rendered glyphs fit the original VML box and turn around its center.
+    /// </summary>
+    private HImage? WordArtWatermark(XElement shape, Dictionary<string, string> style, HText text, int width, int height, HAnchor anchor)
+    {
+        var angle = VmlNumber(style.GetValueOrDefault("rotation"), "fd", 0) % 360;
+        var opacityAttribute = Attr(shape.Element(V + "fill"), "opacity") ?? Attr(shape, "opacity");
+        var opacity = Math.Clamp(VmlNumber(opacityAttribute, "f", 1), 0, 1);
+        if (width <= 0 || height <= 0 || (angle == 0 && opacityAttribute is null))
+            return null;
+        var color = SKColor.TryParse(text.Format.Color, out var fill) ? fill : SKColors.Black;
+        var alpha = (byte)Math.Round(opacity * 255);
+
+        var fontStyle = text.Format.Bold == true
+            ? (text.Format.Italic == true ? SKFontStyle.BoldItalic : SKFontStyle.Bold)
+            : (text.Format.Italic == true ? SKFontStyle.Italic : SKFontStyle.Normal);
+        var other = text.Text.EnumerateRunes().FirstOrDefault(r => r.Value > 0x24f);
+        // SkiaSharp can return the same managed typeface from multiple font lookups.
+        var requested = SKFontManager.Default.MatchFamily(text.Format.Font, fontStyle);
+        var fallback = requested?.ContainsGlyphs(text.Text) == true || other.Value == 0
+            ? null : SKFontManager.Default.MatchCharacter(null, fontStyle, null, other.Value);
+        using var font = new SKFont(fallback ?? requested ?? SKTypeface.Default, 100);
+        using var glyphs = new GlyphOutlines();
+        using var outline = new SKPath { FillType = SKPathFillType.Winding };
+        if (!glyphs.AppendShaped(outline, text.Text, font, 0, 0, SKTextAlign.Left) || outline.IsEmpty)
+            return null;
+        var bounds = outline.TightBounds;
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+            return null;
+
+        var radians = angle * Math.PI / 180;
+        var (cosine, sine) = (Math.Abs(Math.Cos(radians)), Math.Abs(Math.Sin(radians)));
+        var rotatedWidth = (int)Math.Min(int.MaxValue, Math.Ceiling(width * cosine + height * sine));
+        var rotatedHeight = (int)Math.Min(int.MaxValue, Math.Ceiling(width * sine + height * cosine));
+        var scale = (float)Math.Min(0.03, 2400.0 / Math.Max(rotatedWidth, rotatedHeight)); // 216 dpi, bounded
+        var pixelsWide = (int)Math.Ceiling(rotatedWidth * scale);
+        var pixelsHigh = (int)Math.Ceiling(rotatedHeight * scale);
+        using var bitmap = new SKBitmap(pixelsWide, pixelsHigh, SKColorType.Rgba8888, SKAlphaType.Premul);
+        using var canvas = new SKCanvas(bitmap);
+        using var paint = new SKPaint { Color = color.WithAlpha(alpha), IsAntialias = true };
+        canvas.Clear(SKColors.Transparent);
+        canvas.Translate(pixelsWide / 2f, pixelsHigh / 2f);
+        canvas.RotateDegrees((float)angle);
+        canvas.Scale(width * scale / bounds.Width, height * scale / bounds.Height);
+        canvas.Translate(-bounds.MidX, -bounds.MidY);
+        canvas.DrawPath(outline, paint);
+
+        var key = $"watermark|{width}|{height}|{angle}|{opacity}|{text.Format}|{text.Text}";
+        if (!_media.TryGetValue(key, out var path))
+        {
+            Directory.CreateDirectory(_mediaFolder);
+            path = Path.Combine(_mediaFolder, $"docx-media-{_media.Count + 1}.png");
+            using var data = bitmap.Encode(SKEncodedImageFormat.Png, 100);
+            using var file = File.Create(path);
+            data.SaveTo(file);
+            _media[key] = path;
+        }
+        return new HImage(path)
+        {
+            Width = rotatedWidth,
+            Height = rotatedHeight,
+            Anchor = anchor with
+            {
+                HorizontalOffset = anchor.HorizontalOffset + AlignedOffset(anchor.HorizontalAlign, (width - rotatedWidth) / 2, rotatedWidth, width),
+                VerticalOffset = anchor.VerticalOffset + AlignedOffset(anchor.VerticalAlign, (height - rotatedHeight) / 2, rotatedHeight, height),
+            },
+        };
+    }
+
+    private static double VmlNumber(string? value, string fixedSuffix, double fallback)
+    {
+        if (value is null)
+            return fallback;
+        var divisor = value.EndsWith(fixedSuffix, StringComparison.Ordinal) ? 65536.0 : value.EndsWith('%') ? 100 : 1;
+        var number = divisor == 65536 ? value[..^fixedSuffix.Length] : divisor == 100 ? value[..^1] : value;
+        return double.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) && double.IsFinite(parsed)
+            ? parsed / divisor : fallback;
     }
 
     private static string? VmlFill(XElement shape) =>

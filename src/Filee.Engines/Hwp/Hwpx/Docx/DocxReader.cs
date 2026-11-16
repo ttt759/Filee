@@ -383,12 +383,14 @@ internal sealed partial class DocxReader
         var cell = HwpxUnits.FromTwips(pitch);
         var natural = size * SingleLinePercent(paragraph) / 100.0; // 1/100 pt = HWPUNIT
         var lines = Math.Max(1, Math.Ceiling(natural / cell));
-        var multiple = (props.Line ?? 240) / 240.0;
+        // A line snapped to the Word grid cannot advance by less than one grid row.
+        var multiple = Math.Max(1, (props.Line ?? 240) / 240.0);
         paragraph.Format = paragraph.Format with { LineSpacing = new HLineSpacing(HLineSpacingKind.AtLeast, (int)Math.Round(lines * cell * multiple)) };
     }
 
     /// <summary>Style and contextual-spacing flag of the paragraphs read so far, to compare a paragraph with the one before it.</summary>
     private readonly Dictionary<HParagraph, (string? StyleId, bool Contextual)> _paragraphStyles = [];
+    private readonly HashSet<HParagraph> _emptyRunPageBreaks = [];
 
     private void RememberParagraphStyle(HParagraph paragraph, ParaProps props) =>
         _paragraphStyles[paragraph] = (props.StyleId, props.ContextualSpacing == true);
@@ -398,15 +400,22 @@ internal sealed partial class DocxReader
     /// List Number styles): a paragraph with it loses the space above when the paragraph before has its style, and the
     /// space below when the next one does. Without this every list item kept its 10 pt gap and the pages ran long (#1194).
     /// </summary>
-    private void ApplyContextualSpacing(HParagraph previous, HParagraph current, ParaProps props)
+    private void ApplyParagraphSpacing(HParagraph previous, HParagraph current, ParaProps props)
     {
-        if (current.PageBreakBefore || current.ColumnBreakBefore
-            || !_paragraphStyles.TryGetValue(previous, out var before) || before.StyleId != props.StyleId)
+        if (current.PageBreakBefore || current.ColumnBreakBefore)
             return;
-        if (before.Contextual)
-            previous.Format = previous.Format with { After = 0 };
-        if (props.ContextualSpacing == true)
-            current.Format = current.Format with { Before = 0 };
+        if (_paragraphStyles.TryGetValue(previous, out var before) && before.StyleId == props.StyleId)
+        {
+            if (before.Contextual)
+                previous.Format = previous.Format with { After = 0 };
+            if (props.ContextualSpacing == true)
+                current.Format = current.Format with { Before = 0 };
+        }
+
+        // Word uses the larger of the adjoining gaps. HWPX readers add both, so keep the
+        // trailing gap on the previous paragraph and use only the remaining leading gap here.
+        if (previous.Format.After is > 0 and var trailing && current.Format.Before is > 0 and var leading)
+            current.Format = current.Format with { Before = Math.Max(0, leading - trailing) };
     }
 
     /// <summary>
@@ -562,7 +571,10 @@ internal sealed partial class DocxReader
     private void ReadBlock(XElement element, List<HBlock> output)
     {
         if (element.Name == W + "p")
-            ReadParagraph(element, output);
+        {
+            if (!TryReadFrame(element, output))
+                ReadParagraph(element, output);
+        }
         else if (element.Name == W + "tbl")
         {
             _tableDepth++;
@@ -587,6 +599,7 @@ internal sealed partial class DocxReader
         private readonly HListRef? _list;
         private readonly ParaProps _props;
         private readonly Stack<List<HInline>> _sinks = new();
+        private bool _startsWithRunPageBreak;
 
         public ParagraphBuilder(DocxReader reader, List<HBlock> output, ParaProps props, RunProps mark, XElement? pPr)
         {
@@ -633,15 +646,19 @@ internal sealed partial class DocxReader
         /// <summary>Continues in a new paragraph that starts on a new page or column.</summary>
         public void Break(bool page)
         {
-            if (Current.Inlines.Count > 0)
+            if (Current.Inlines.Count > 0 || (page && Current.PageBreakBefore))
             {
                 Emit();
                 // The rest of a list item is not numbered again.
                 Current = NewParagraph(_list is null ? null : _list with { Numbered = false });
+                _startsWithRunPageBreak = false;
                 _sinks.Clear();
             }
             if (page)
+            {
                 Current.PageBreakBefore = true;
+                _startsWithRunPageBreak = true;
+            }
             else
                 Current.ColumnBreakBefore = true;
         }
@@ -654,6 +671,7 @@ internal sealed partial class DocxReader
             Emit();
             Current = NewParagraph(_list is null ? null : _list with { Numbered = false });
             Current.Format = format with { Before = 0 };
+            _startsWithRunPageBreak = false;
             _sinks.Clear();
         }
 
@@ -665,9 +683,24 @@ internal sealed partial class DocxReader
             _reader.SnapToGrid(Current, _props);
             if (_output.LastOrDefault() is HParagraph previous)
             {
-                JoinBorders(previous, Current);
-                _reader.ApplyContextualSpacing(previous, Current, _props);
+                if (!Current.PageBreakBefore && !Current.ColumnBreakBefore && _reader._emptyRunPageBreaks.Remove(previous))
+                {
+                    // A trailing or standalone w:br does not place an extra blank paragraph at the top of the new page.
+                    _output.RemoveAt(_output.Count - 1);
+                    _reader._paragraphStyles.Remove(previous);
+                    Current.PageBreakBefore = true;
+                    Current.Format = Current.Format with { Before = 0 };
+                }
+                else
+                {
+                    JoinBorders(previous, Current);
+                    _reader.ApplyParagraphSpacing(previous, Current, _props);
+                }
             }
+            if (_startsWithRunPageBreak && !Current.ColumnBreakBefore && Current.Inlines.Count == 0
+                && Current.List?.Numbered != true && Current.Format.Borders is null
+                && Current.Format.Fill is null && Current.Format.LeftBar is null)
+                _reader._emptyRunPageBreaks.Add(Current);
             _reader.RememberParagraphStyle(Current, _props);
             _output.Add(Current);
         }
@@ -775,6 +808,13 @@ internal sealed partial class DocxReader
             case "t":
                 if (ShowsText())
                 {
+                    if (_fields.LastOrDefault()?.PageField is { } cached)
+                    {
+                        if (cached.Text.Length == 0 && child.Value.Length > 0)
+                            cached.Format = format;
+                        cached.Text.Append(child.Value);
+                        break;
+                    }
                     // Text typed in Wingdings & co. ("þ" for ☑) becomes the Unicode characters it shows.
                     foreach (var text in SymbolFonts.Runs(child.Value, format))
                         builder.Add(text);
@@ -870,7 +910,10 @@ internal sealed partial class DocxReader
                 "right" => HAlign.Right,
                 _ => HAlign.Center,
             };
-            builder.Current.Format = builder.Current.Format with { Align = align };
+            // A centered Word display uses the paragraph's text area. Its prose
+            // first-line indent does not move the center of the equation.
+            var paragraphFormat = builder.Current.Format;
+            builder.Current.Format = paragraphFormat with { Align = align, FirstLine = align == HAlign.Center ? 0 : paragraphFormat.FirstLine };
         }
 
         // Width of the line in the body; in a cell or a text box the width isn't known here.
@@ -932,6 +975,7 @@ internal sealed partial class DocxReader
         {
             Width = boxWidth,
             Height = boxHeight,
+            IsEquationNumber = true,
             Line = HBorder.None,
             Padding = new HInsets(0, 0, 0, 0),
             Anchor = new HAnchor("COLUMN", "LEFT", width - boxWidth, "PARA", "TOP", Math.Max(0, middle - boxHeight / 2), "IN_FRONT_OF_TEXT", true),
@@ -990,6 +1034,14 @@ internal sealed partial class DocxReader
         public bool Result;
         public bool Suppress;
         public string? Target;
+        public CachedPageField? PageField;
+    }
+
+    private sealed class CachedPageField(HFieldKind kind, HCharFormat format)
+    {
+        public HFieldKind Kind { get; } = kind;
+        public HCharFormat Format = format;
+        public readonly StringBuilder Text = new();
     }
 
     /// <summary>Field result text is shown unless we are inside an instruction or a field we replace (PAGE ...).</summary>
@@ -1030,7 +1082,13 @@ internal sealed partial class DocxReader
         switch (words.FirstOrDefault()?.ToUpperInvariant())
         {
             case "PAGE" or "NUMPAGES" or "SECTIONPAGES" when _inFirstPageHeader && _tableDepth > 0:
-                // rhwp leaves a page number in a table in a text box blank: Word's result, which comes next, stays.
+                // rhwp leaves native page numbers in a table in a text box blank. Retain the cache and the field kind.
+                field.PageField = new CachedPageField(words[0].ToUpperInvariant() switch
+                {
+                    "PAGE" => HFieldKind.PageNumber,
+                    "SECTIONPAGES" => HFieldKind.SectionPages,
+                    _ => HFieldKind.TotalPages,
+                }, format);
                 break;
             case "HYPERLINK":
                 {
@@ -1067,6 +1125,14 @@ internal sealed partial class DocxReader
             return;
         var field = _fields[^1];
         _fields.RemoveAt(_fields.Count - 1);
+        if (field.PageField is { } cached && ShowsText())
+        {
+            var text = cached.Text.ToString();
+            // Other number formats keep their cached spelling, including Roman numerals and custom formats.
+            builder.Add(text.Trim().All(char.IsAsciiDigit)
+                ? new HCachedPageField(text, cached.Format, cached.Kind)
+                : new HText(text, cached.Format));
+        }
         if (field.Target is not null)
             builder.CloseLink();
     }

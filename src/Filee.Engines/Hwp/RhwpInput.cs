@@ -32,6 +32,7 @@ using System.IO.Compression;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using Filee.Engines.Hwp.Hwpx;
 using Filee.Engines.Infrastructure;
 
 namespace Filee.Engines.Hwp;
@@ -71,8 +72,13 @@ internal static partial class RhwpInput
     /// changing (or the file is not an HWPX package Filee can read).
     /// </summary>
     /// <param name="lookup">Installed fonts by name (tests pass a fake computer).</param>
-    public static string? Prepare(string hwpx, string workDirectory, Func<string, InstalledFont?>? lookup = null)
+    public static string? Prepare(string hwpx, string workDirectory, Func<string, InstalledFont?>? lookup = null) =>
+        Prepare(hwpx, workDirectory, out _, lookup);
+
+    internal static string? Prepare(string hwpx, string workDirectory, out List<string> pageFieldSections,
+        Func<string, InstalledFont?>? lookup = null)
     {
+        pageFieldSections = [];
         try
         {
             var changed = new Dictionary<string, XDocument>(StringComparer.Ordinal);
@@ -107,6 +113,8 @@ internal static partial class RhwpInput
 
             foreach (var (name, xml) in sections)
             {
+                if (PageFieldMarkers(xml).Any())
+                    pageFieldSections.Add(name);
                 if (FixShapeSizes(xml) | NormaliseEquations(xml) | GroupFloatingHeaderPictures(xml) | ShowHeaderPictures(xml) | (fromHwp && AnchorTablesInCells(xml)))
                     changed[name] = xml;
                 if (SpaceEquationLines(xml, header))
@@ -245,14 +253,22 @@ internal static partial class RhwpInput
         var changed = false;
         // Listed first: a group holds copies of its picture, and a walk going on into them would find a header nested in
         // the picture twice over, at every level (a few kilobytes would come to more than any memory holds).
-        var paragraphs = section.Descendants().Where(e => e.Name.LocalName is "header" or "footer").Elements()
-            .Where(e => e.Name.LocalName == "subList").Elements().Where(e => e.Name.LocalName == "p" && Child(e, "linesegarray") is null).ToList();
+        var headerParagraphs = section.Descendants().Where(e => e.Name.LocalName is "header" or "footer").Elements()
+            .Where(e => e.Name.LocalName == "subList").Elements();
+        // A first-page header is a text box. rhwp draws the pictures inside its table cells but ignores the
+        // anchors of ungrouped pictures, placing them on the text baseline instead.
+        var firstPageCells = section.Descendants().Where(e => e.Name.LocalName == "drawText" && (string?)e.Attribute("name") == HwpxWriter.FirstPageHeaderName)
+            .Descendants().Where(e => e.Name.LocalName == "p" && e.Parent?.Parent?.Name.LocalName == "tc");
+        var paragraphs = headerParagraphs.Concat(firstPageCells)
+            .Where(e => e.Name.LocalName == "p" && Child(e, "linesegarray") is null).ToList();
+        var page = section.Descendants().FirstOrDefault(e => e.Name.LocalName == "pagePr");
         foreach (var paragraph in paragraphs)
         {
             var runs = paragraph.Elements().Where(e => e.Name.LocalName == "run").ToList();
             var floating = runs.Elements().Where(e => e.Name.LocalName == "pic" && (string?)Child(e, "pos")?.Attribute("treatAsChar") == "0").ToList();
             foreach (var picture in floating)
             {
+                PositionCenteredHeaderBackground(picture, page);
                 var group = new XElement(picture.Name.Namespace + "container", picture.Attributes());
                 group.Add(Layout("offset", "orgSz", "curSz", "flip", "rotationInfo", "renderingInfo"));
                 group.Add(new XElement(picture));
@@ -275,6 +291,29 @@ internal static partial class RhwpInput
             changed = true;
         }
         return changed;
+    }
+
+    // Some rhwp versions center a header picture around the top of the header instead of the page.
+    // A paper-relative top offset has the same meaning in both versions.
+    private static void PositionCenteredHeaderBackground(XElement picture, XElement? page)
+    {
+        if ((string?)picture.Attribute("textWrap") != "BEHIND_TEXT" || Child(picture, "pos") is not { } position
+            || (string?)position.Attribute("vertAlign") != "CENTER"
+            || (string?)position.Attribute("vertRelTo") is not ("PAGE" or "PAPER"))
+            return;
+
+        var height = Number(Child(picture, "sz"), "height") ?? 0;
+        var extent = Number(page, (string?)page?.Attribute("landscape") == "NARROWLY" ? "width" : "height") ?? 0;
+        if (height <= 0 || extent <= 0)
+            return;
+
+        var margin = (string?)position.Attribute("vertRelTo") == "PAGE" ? Child(page, "margin") : null;
+        var top = (long)(Number(margin, "top") ?? 0) + (Number(margin, "header") ?? 0);
+        var bottom = (long)(Number(margin, "bottom") ?? 0) + (Number(margin, "footer") ?? 0);
+        var offset = (extent + top - bottom - height) / 2 + (Number(position, "vertOffset") ?? 0);
+        position.SetAttributeValue("vertRelTo", "PAPER");
+        position.SetAttributeValue("vertAlign", "TOP");
+        position.SetAttributeValue("vertOffset", (int)Math.Clamp(offset, int.MinValue, int.MaxValue));
     }
 
     /// <summary>

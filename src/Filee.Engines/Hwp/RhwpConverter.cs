@@ -196,7 +196,10 @@ public sealed class RhwpConverter : IConverter, ITextShapingCheck
             if (!File.Exists(hwpx) || new FileInfo(hwpx).Length == 0)
                 return step.InputPath;
         }
-        return RhwpInput.Prepare(hwpx, step.WorkDirectory) ?? step.InputPath;
+        var input = RhwpInput.Prepare(hwpx, step.WorkDirectory, out var pageFieldSections) ?? step.InputPath;
+        return pageFieldSections.Count == 0 || FormatRegistry.Detect(step.OriginalSourcePath ?? step.InputPath)?.Id != "docx"
+            ? input
+            : await RhwpInput.ResolveFirstPageFieldsAsync(exe, input, pageFieldSections, step.WorkDirectory, cancellationToken);
     }
 
     /// <summary>How long one rhwp run on a document with <paramref name="textBytes"/> of text may take.</summary>

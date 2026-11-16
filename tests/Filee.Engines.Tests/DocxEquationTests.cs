@@ -43,6 +43,9 @@ public class DocxEquationTests(EngineFixture fx) : IClassFixture<EngineFixture>
     private static string Matrix(params string[][] rows) =>
         "<m:m>" + string.Concat(rows.Select(r => "<m:mr>" + string.Concat(r.Select(c => $"<m:e>{c}</m:e>")) + "</m:mr>")) + "</m:m>";
 
+    private static string EquationArray(params string[] rows) =>
+        "<m:eqArr>" + string.Concat(rows.Select(r => $"<m:e>{r}</m:e>")) + "</m:eqArr>";
+
     private static string Math(string content) => $"<m:oMath>{content}</m:oMath>";
 
     private static string Display(string content) => $"<m:oMathPara><m:oMath>{content}</m:oMath></m:oMathPara>";
@@ -228,7 +231,8 @@ public class DocxEquationTests(EngineFixture fx) : IClassFixture<EngineFixture>
         var pdf = await ConvertAsync(SampleDocument(), "equations", "pdf");
         using (var document = PdfDocument.Open(pdf))
         {
-            var text = string.Concat(document.GetPages().Select(p => p.Text));
+            // Newer rhwp releases use the Unicode mathematical italic forms.
+            var text = string.Concat(document.GetPages().Select(p => p.Text)).Normalize(System.Text.NormalizationForm.FormKC);
             Assert.Contains("sentence", text);
             Assert.Contains("equations", text); // the paragraph after them
             foreach (var symbol in new[] { "α", "β", "γ", "Ω", "∑" })
@@ -243,6 +247,77 @@ public class DocxEquationTests(EngineFixture fx) : IClassFixture<EngineFixture>
         var svg = string.Concat(Directory.GetFiles(folder, "*.svg").Select(File.ReadAllText));
         Assert.Contains("∑", svg);
         Assert.DoesNotContain("scale(", svg);
+    }
+
+    [Fact]
+    public async Task Unmarked_equation_array_rows_are_centered_inside_the_brace()
+    {
+        var rhwp = fx.Converters.Single(c => c.Id == "rhwp");
+        Assert.SkipUnless(fx.Catalog.StatusOf(rhwp).IsAvailable, "rhwp not found (pwsh build/fetch-engines.ps1 -Only rhwp)");
+
+        var array = EquationArray(MR("x=1"), MR("x=123456"));
+        var source = new DocxBuilder().Paragraph(P(Display(Delimited(array, "{"))));
+        using var pdf = PdfDocument.Open(await ConvertAsync(source, "centered-system", "pdf"));
+        var equals = Assert.Single(pdf.GetPages()).Letters.Where(l => l.Value == "=").OrderByDescending(l => l.StartBaseLine.Y).ToArray();
+        Assert.Equal(2, equals.Length);
+        Assert.True(equals[0].StartBaseLine.X > equals[1].StartBaseLine.X + 5);
+    }
+
+    [Fact]
+    public async Task A_tall_display_system_starts_at_the_body_top_and_its_number_stays_centered()
+    {
+        var rhwp = fx.Converters.Single(c => c.Id == "rhwp");
+        Assert.SkipUnless(fx.Catalog.StatusOf(rhwp).IsAvailable, "rhwp not found (pwsh build/fetch-engines.ps1 -Only rhwp)");
+
+        var array = EquationArray(Enumerable.Repeat(Frac(MR("a"), MR("b")) + MR("=x"), 9).ToArray());
+        var equation = NumberedArray(Delimited(array, "{"), Delimited(MR("7")));
+        var source = new DocxBuilder().Paragraph(P(Display(equation))).Paragraph(P(R("After the system.")));
+        using var pdf = PdfDocument.Open(await ConvertAsync(source, "tall-system", "pdf"));
+        var page = Assert.Single(pdf.GetPages());
+        var equals = page.Letters.Where(l => l.Value == "=").Select(l => l.StartBaseLine.Y).OrderDescending().ToArray();
+        Assert.Equal(9, equals.Length);
+        Assert.InRange(page.Height - equals[0], 72, 105);
+        Assert.Contains("Afterthesystem.", page.Text.Replace(" ", ""));
+        var after = Assert.Single(page.Letters, l => l.Value == "A");
+        Assert.True(after.StartBaseLine.Y < equals[^1]);
+        var number = Assert.Single(page.Letters, l => l.Value == "7");
+        Assert.InRange(System.Math.Abs(number.StartBaseLine.Y - (equals[0] + equals[^1]) / 2), 0, 10);
+    }
+
+    [Fact]
+    public async Task Successive_equation_paragraphs_flow_onto_the_same_page()
+    {
+        var rhwp = fx.Converters.Single(c => c.Id == "rhwp");
+        Assert.SkipUnless(fx.Catalog.StatusOf(rhwp).IsAvailable, "rhwp not found (pwsh build/fetch-engines.ps1 -Only rhwp)");
+
+        var array = EquationArray(Enumerable.Repeat(Frac(MR("a"), MR("b")) + MR("=x"), 5).ToArray());
+        var source = new DocxBuilder()
+            .Paragraph(P(Display(NumberedArray(Delimited(array, "{"), Delimited(MR("7")))), "<w:spacing w:line=\"360\" w:lineRule=\"auto\"/>"))
+            .Paragraph(P(Display(MR("c=1"))))
+            .Paragraph(P(Display(MR("d=2"))));
+
+        using var pdf = PdfDocument.Open(await ConvertAsync(source, "successive-equations", "pdf"));
+        var page = Assert.Single(pdf.GetPages());
+        var equals = page.Letters.Where(l => l.Value == "=").Select(l => l.StartBaseLine.Y).OrderDescending().ToArray();
+        Assert.Equal(7, equals.Length);
+        Assert.InRange(equals[4] - equals[5], 0, 40);
+    }
+
+    [Fact]
+    public async Task Centered_display_equations_ignore_the_prose_first_line_indent()
+    {
+        var rhwp = fx.Converters.Single(c => c.Id == "rhwp");
+        Assert.SkipUnless(fx.Catalog.StatusOf(rhwp).IsAvailable, "rhwp not found (pwsh build/fetch-engines.ps1 -Only rhwp)");
+
+        var array = EquationArray(Enumerable.Repeat(Frac(MR("a"), MR("b")) + MR("=x"), 5).ToArray());
+        var source = new DocxBuilder()
+            .Paragraph(P(Display(NumberedArray(Delimited(array, "{"), Delimited(MR("7"))))))
+            .Paragraph(P(Display(NumberedArray(Delimited(array, "{"), Delimited(MR("8")))), "<w:ind w:firstLine=\"720\"/>"));
+
+        using var pdf = PdfDocument.Open(await ConvertAsync(source, "indented-equations", "pdf"));
+        var equals = Assert.Single(pdf.GetPages()).Letters.Where(l => l.Value == "=").OrderByDescending(l => l.StartBaseLine.Y).ToArray();
+        Assert.Equal(10, equals.Length);
+        Assert.InRange(System.Math.Abs(equals[0].StartBaseLine.X - equals[5].StartBaseLine.X), 0, 1);
     }
 
     [Fact]

@@ -10,6 +10,10 @@ namespace Filee.Engines.Hwp.Hwpx;
 
 internal sealed partial class HwpxWriter
 {
+    // These names appear only in intermediate packages for rhwp.
+    internal const string FirstPageHeaderName = "FileeFirstPageHeader";
+    internal const string PageFieldMarker = "filee-page-field";
+
     /// <summary>Width available to the content being written (text width, column, table cell or text box).</summary>
     private int _width = 42520;
 
@@ -91,28 +95,64 @@ internal sealed partial class HwpxWriter
         // first paragraph, and the other header is hidden there. The text below goes around it, as Word moves the body.
         if (section.FirstPageHeader is { } firstPageHeader)
         {
+            var firstBlock = 0;
+            var paddingTop = 0;
+            if (_forRhwpPdf)
+            {
+                // rhwp collapses leading empty paragraphs when it draws a text box's table. Preserve the space
+                // as padding while retaining the box's full height so the body starts in the same place.
+                var blank = firstPageHeader.TakeWhile(b => b is HParagraph { Inlines.Count: 0, List: null } p
+                    && (p.Format.Borders is null || p.Format.Borders == HBorders.Empty)
+                    && p.Format.Fill is null && p.Format.LeftBar is null).ToList();
+                if (blank.Count < firstPageHeader.Count && firstPageHeader[blank.Count] is HTable)
+                {
+                    firstBlock = blank.Count;
+                    paddingTop = Math.Max(0, EstimateHeight(blank, textWidth));
+                }
+            }
             var box = new HTextBox
             {
                 Width = textWidth,
                 Height = EstimateHeight(firstPageHeader, textWidth),
                 Anchor = new HAnchor("PAPER", "LEFT", _pageLeft, "PAPER", "TOP", Margin("top", 4255), "TOP_AND_BOTTOM", true),
                 Line = HBorder.None,
-                Padding = new HInsets(0, 0, 0, 0),
+                Padding = new HInsets(0, 0, paddingTop, 0),
             };
-            box.Blocks.AddRange(firstPageHeader);
-            setup.Append(TextBox(box));
+            box.Blocks.AddRange(firstPageHeader.Skip(firstBlock));
+            setup.Append(TextBox(box, _forRhwpPdf ? FirstPageHeaderName : ""));
         }
 
         var body = new StringBuilder(SectionOpenTag());
         var blocks = section.Blocks.Count == 0 || section.Blocks[0] is not HParagraph
             ? section.Blocks.Prepend(new HParagraph()).ToList()
             : section.Blocks;
+        var wrappedLines = new Dictionary<int, string>();
         for (var i = 0; i < blocks.Count; i++)
         {
             if (blocks[i] is HParagraph { ColumnsChange: { } columns })
                 _width = ColumnWidth(textWidth, columns);
             var controls = (i == 0 ? setup.ToString() : "") + later.GetValueOrDefault(blocks[i]);
-            body.Append(Block(blocks[i], controls.Length > 0 ? $"<hp:run charPrIDRef=\"{_normalCharPrId}\">{controls}</hp:run>" : null));
+            string? leadingRun = null;
+            if (controls.Length > 0)
+            {
+                var controlCharPr = _normalCharPrId;
+                // rhwp uses the run font as the minimum height of an otherwise empty setup paragraph.
+                if (_forRhwpPdf && blocks[i] is HParagraph
+                    { Inlines.Count: 0, Format.LineSpacing: { Kind: HLineSpacingKind.Fixed, Value: > 0 and var height } }
+                    && height < BaseSize(_normalCharPrId))
+                    controlCharPr = CharPr(_normalCharPrId, new HCharFormat(Size: height));
+                leadingRun = $"<hp:run charPrIDRef=\"{controlCharPr}\">{controls}</hp:run>";
+            }
+            var xml = blocks[i] switch
+            {
+                HTable { Anchor: not null } table when _forRhwpPdf =>
+                    FloatingTable(table, leadingRun, blocks, i, wrappedLines),
+                HParagraph p when wrappedLines.Remove(i, out var line) => Paragraph(p, leadingRun, line),
+                HParagraph p when _forRhwpPdf && PicturesHaveClearSpace(p, blocks, i) =>
+                    Paragraph(p, leadingRun, floatPicturesInFront: true),
+                var block => Block(block, leadingRun),
+            };
+            body.Append(xml);
         }
         return body.Append("</hs:sec>").ToString();
     }
@@ -160,7 +200,7 @@ internal sealed partial class HwpxWriter
         _ => "",
     };
 
-    private string Paragraph(HParagraph paragraph, string? leadingRun)
+    private string Paragraph(HParagraph paragraph, string? leadingRun, string? wrappedLine = null, bool floatPicturesInFront = false)
     {
         _plainText.AppendLine();
         var (styleId, paraPrBase, charPrBase) = paragraph.HeadingLevel > 0 && _headings.TryGetValue(paragraph.HeadingLevel, out var heading)
@@ -173,12 +213,19 @@ internal sealed partial class HwpxWriter
             runs.Control(_normalCharPrId, $"<hp:ctrl>{ColumnDefinition(columns)}</hp:ctrl>");
         var size = LargestSize(paragraph.Inlines) ?? paragraph.MarkFormat.Size ?? BaseSize(charPrBase);
         var tabs = new Queue<string>(TabElements(paragraph, size));
-        Inlines(paragraph.Inlines, runs, charPrBase, link: false, tabs);
+        var equationLine = _forRhwpPdf ? EquationLine(paragraph, charPrBase) : null;
+        var markCharPr = CharPr(charPrBase, paragraph.MarkFormat);
+        Inlines(paragraph.Inlines, runs, charPrBase, link: false, tabs, equationLine?.Height,
+            floatPicturesInFront, floatPicturesInFront && paragraph.Inlines.All(i => i is HImage) ? markCharPr : null);
 
         var sb = new StringBuilder();
         sb.Append($"<hp:p id=\"0\" paraPrIDRef=\"{paraPrId}\" styleIDRef=\"{styleId}\" pageBreak=\"{(paragraph.PageBreakBefore ? 1 : 0)}\" columnBreak=\"{(paragraph.ColumnBreakBefore ? 1 : 0)}\" merged=\"0\">");
         sb.Append(leadingRun);
-        sb.Append(runs.Finish(CharPr(charPrBase, paragraph.MarkFormat), leadingRun is not null));
+        sb.Append(runs.Finish(markCharPr, leadingRun is not null));
+        if (equationLine is { } line)
+            sb.Append(line.Xml);
+        else
+            sb.Append(wrappedLine);
         return sb.Append("</hp:p>").ToString();
     }
 
@@ -251,7 +298,8 @@ internal sealed partial class HwpxWriter
     }
 
     /// <param name="tabs">Pre-computed inline tab elements of the paragraph, in order (see TabElements).</param>
-    private void Inlines(IEnumerable<HInline> inlines, RunBuilder runs, string charPrBase, bool link, Queue<string> tabs)
+    private void Inlines(IEnumerable<HInline> inlines, RunBuilder runs, string charPrBase, bool link, Queue<string> tabs,
+        int? equationLineHeight = null, bool floatPicturesInFront = false, string? pictureCharPr = null)
     {
         foreach (var inline in inlines)
         {
@@ -260,6 +308,11 @@ internal sealed partial class HwpxWriter
                 case HEquation equation:
                     runs.Control(CharPr(charPrBase, equation.Format, link), Equation(equation, charPrBase), isObject: true);
                     _plainText.Append(equation.Text);
+                    break;
+                case HCachedPageField cached when _forRhwpPdf:
+                    runs.Control(CharPr(charPrBase, cached.Format, link),
+                        $"<?{PageFieldMarker} {cached.Kind}?><hp:t>{Escape(cached.Text)}</hp:t>");
+                    _plainText.Append(cached.Text);
                     break;
                 case HText text:
                     runs.Text(CharPr(charPrBase, text.Format, link), Escape(text.Text));
@@ -293,11 +346,14 @@ internal sealed partial class HwpxWriter
                     runs.Control(charPrBase, Note(note));
                     break;
                 case HImage image:
-                    if (Picture(image) is { } picture)
-                        runs.Control(charPrBase, picture, isObject: true);
+                    if (Picture(image, floatPicturesInFront) is { } picture)
+                        runs.Control(pictureCharPr ?? charPrBase, picture, isObject: true);
                     break;
                 case HTextBox box:
-                    runs.Control(charPrBase, TextBox(box), isObject: true);
+                    var anchor = box.IsEquationNumber && box.Anchor is { } original && equationLineHeight is { } height
+                        ? original with { VerticalOffset = Math.Max(0, (height - box.Height) / 2) }
+                        : box.Anchor;
+                    runs.Control(charPrBase, TextBox(box, anchorOverride: anchor), isObject: true);
                     break;
                 case HShape shape:
                     runs.Control(charPrBase, Shape(shape), isObject: true);
@@ -308,7 +364,7 @@ internal sealed partial class HwpxWriter
 
     // ───────────────────────── Tables ─────────────────────────
 
-    private string Table(HTable table, string? leadingRun)
+    private string Table(HTable table, string? leadingRun, HAnchor? anchorOverride = null, string? wrappedLine = null)
     {
         if (table.Rows.Count == 0)
             return leadingRun is null ? "" : Paragraph(new HParagraph(), leadingRun);
@@ -322,10 +378,11 @@ internal sealed partial class HwpxWriter
         var margin = table.CellMargin ?? new HInsets(510, 510, 141, 141);
         var tableBorders = table.Borders ?? HBorders.Grid;
         var headerRows = table.Rows.TakeWhile(r => r.Header).Count();
+        var anchor = anchorOverride ?? table.Anchor;
 
         var sb = new StringBuilder();
         var id = NextId();
-        sb.Append($"<hp:tbl id=\"{id}\" zOrder=\"0\" numberingType=\"TABLE\" textWrap=\"TOP_AND_BOTTOM\" textFlow=\"BOTH_SIDES\" lock=\"0\" dropcapstyle=\"None\" pageBreak=\"CELL\" repeatHeader=\"{(headerRows > 0 ? 1 : 0)}\" rowCnt=\"{table.Rows.Count}\" colCnt=\"{columnCount}\" cellSpacing=\"0\" borderFillIDRef=\"{BorderFillId(tableBorders, null)}\" noAdjust=\"0\">");
+        sb.Append($"<hp:tbl id=\"{id}\" zOrder=\"0\" numberingType=\"TABLE\" textWrap=\"{anchor?.Wrap ?? "TOP_AND_BOTTOM"}\" textFlow=\"BOTH_SIDES\" lock=\"0\" dropcapstyle=\"None\" pageBreak=\"CELL\" repeatHeader=\"{(headerRows > 0 ? 1 : 0)}\" rowCnt=\"{table.Rows.Count}\" colCnt=\"{columnCount}\" cellSpacing=\"0\" borderFillIDRef=\"{BorderFillId(tableBorders, null)}\" noAdjust=\"0\">");
         sb.Append($"<hp:sz width=\"{totalWidth}\" widthRelTo=\"ABSOLUTE\" height=\"{rowHeights.Sum()}\" heightRelTo=\"ABSOLUTE\" protect=\"0\"/>");
         var horizontalAlign = table.Align switch
         {
@@ -333,8 +390,10 @@ internal sealed partial class HwpxWriter
             HAlign.Right => "RIGHT",
             _ => "LEFT",
         };
-        sb.Append($"<hp:pos treatAsChar=\"0\" affectLSpacing=\"0\" flowWithText=\"1\" allowOverlap=\"0\" holdAnchorAndSO=\"0\" vertRelTo=\"PARA\" horzRelTo=\"COLUMN\" vertAlign=\"TOP\" horzAlign=\"{horizontalAlign}\" vertOffset=\"0\" horzOffset=\"{(table.Align == HAlign.Left ? table.Indent : 0)}\"/>");
-        sb.Append($"<hp:outMargin left=\"0\" right=\"0\" top=\"0\" bottom=\"{(table.Tight ? 0 : 1417)}\"/>");
+        sb.Append(Position(anchor ?? new HAnchor("COLUMN", horizontalAlign, table.Align == HAlign.Left ? table.Indent : 0,
+            "PARA", "TOP", 0, "TOP_AND_BOTTOM", false)));
+        var clearance = anchor is null ? new HInsets(0, 0, 0, table.Tight ? 0 : 1417) : table.OuterMargin;
+        sb.Append($"<hp:outMargin left=\"{clearance.Left}\" right=\"{clearance.Right}\" top=\"{clearance.Top}\" bottom=\"{clearance.Bottom}\"/>");
         sb.Append($"<hp:inMargin left=\"{margin.Left}\" right=\"{margin.Right}\" top=\"{margin.Top}\" bottom=\"{margin.Bottom}\"/>");
 
         var outerWidth = _width;
@@ -351,6 +410,8 @@ internal sealed partial class HwpxWriter
                 for (var i = r; i < r + cell.RowSpan && i < rowHeights.Length; i++)
                     height += rowHeights[i];
 
+                if (_forRhwpPdf)
+                    cellMargin = RenderCellMargin(table, cell, cellMargin, width);
                 _width = Math.Max(1000, width - cellMargin.Left - cellMargin.Right);
                 var verticalAlign = cell.VerticalAlign switch
                 {
@@ -358,7 +419,7 @@ internal sealed partial class HwpxWriter
                     HVerticalAlign.Bottom => "BOTTOM",
                     _ => "TOP",
                 };
-                sb.Append($"<hp:tc name=\"\" header=\"{(r < headerRows ? 1 : 0)}\" hasMargin=\"{(cell.CellMargin is not null ? 1 : 0)}\" protect=\"0\" editable=\"0\" dirty=\"0\" borderFillIDRef=\"{BorderFillId(cell.Borders ?? tableBorders, cell.Fill)}\">");
+                sb.Append($"<hp:tc name=\"\" header=\"{(r < headerRows ? 1 : 0)}\" hasMargin=\"{(cell.CellMargin is not null || cellMargin != margin ? 1 : 0)}\" protect=\"0\" editable=\"0\" dirty=\"0\" borderFillIDRef=\"{BorderFillId(cell.Borders ?? tableBorders, cell.Fill)}\">");
                 sb.Append(SubList(cell.Blocks, verticalAlign));
                 sb.Append($"<hp:cellAddr colAddr=\"{column}\" rowAddr=\"{r}\"/>");
                 sb.Append($"<hp:cellSpan colSpan=\"{cell.ColSpan}\" rowSpan=\"{cell.RowSpan}\"/>");
@@ -379,7 +440,7 @@ internal sealed partial class HwpxWriter
             : (_base.ParaPrId, _base.CharPrId);
         var runs = new RunBuilder();
         runs.Control(charPrId, sb.ToString(), isObject: true);
-        var paragraph = $"<hp:p id=\"0\" paraPrIDRef=\"{paraPrId}\" styleIDRef=\"{_base.StyleId}\" pageBreak=\"{(table.PageBreakBefore ? 1 : 0)}\" columnBreak=\"0\" merged=\"0\">{leadingRun}{runs.Finish(charPrId, leadingRun is not null)}</hp:p>";
+        var paragraph = $"<hp:p id=\"0\" paraPrIDRef=\"{paraPrId}\" styleIDRef=\"{_base.StyleId}\" pageBreak=\"{(table.PageBreakBefore ? 1 : 0)}\" columnBreak=\"0\" merged=\"0\">{leadingRun}{runs.Finish(charPrId, leadingRun is not null)}{wrappedLine}</hp:p>";
         return paragraph + string.Concat(table.Caption.Select(b => Block(b)));
     }
 

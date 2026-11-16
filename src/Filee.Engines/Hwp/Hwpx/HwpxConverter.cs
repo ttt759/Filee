@@ -52,7 +52,7 @@ public sealed class HwpxConverter : IConverter
         var output = step.Output.Allocate("hwpx");
         if (output is null)
             return [];
-        HwpxWriter.Write(document, output);
+        HwpxWriter.Write(document, output, forRhwpPdf: step.Preset.TargetFormat == "pdf");
         progress?.Report(1);
         return [output];
     }

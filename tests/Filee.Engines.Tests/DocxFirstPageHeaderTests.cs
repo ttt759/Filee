@@ -27,7 +27,8 @@ public class DocxFirstPageHeaderTests(EngineFixture fx) : IClassFixture<EngineFi
     {
         var rhwp = fx.Converters.Single(c => c.Id == "rhwp");
         Assert.SkipUnless(fx.Catalog.StatusOf(rhwp).IsAvailable, "rhwp not found (pwsh build/fetch-engines.ps1 -Only rhwp)");
-        var job = await fx.ConvertAsync([docx.Save(Path.Combine(fx.NewFolder(), "source.docx"))], new Preset { TargetFormat = "pdf" });
+        var catalog = new ConverterCatalog(fx.Converters.Where(c => c.Id is "hwpx-writer" or "rhwp"));
+        var job = await fx.ConvertAsync([docx.Save(Path.Combine(fx.NewFolder(), "source.docx"))], new Preset { TargetFormat = "pdf" }, catalog);
         Assert.True(job.State == JobState.Completed, string.Join("; ", job.Files.Select(f => $"{f.ErrorKey} {f.ErrorDetail}")));
         using var document = PdfDocument.Open(job.Outputs.Single());
         return document.GetPages().Select(p => (p.Text, p.GetWords().ToList())).ToList();
@@ -82,20 +83,33 @@ public class DocxFirstPageHeaderTests(EngineFixture fx) : IClassFixture<EngineFi
     }
 
     [Fact]
-    public async Task Page_numbers_are_live_in_a_paragraph_and_Words_own_in_a_table()
+    public async Task Page_fields_in_a_first_page_header_table_use_the_pdf_pagination()
     {
-        // rhwp leaves a page number in a table in a text box blank.
         var docx = new DocxBuilder();
-        var first = docx.Header(P(R("Live ") + Field("PAGE", "77")) + Table(P(R("Kept ") + Field("PAGE", "88") + R(" of ") + Field("NUMPAGES", "99"))) + P(""));
+        var first = docx.Header(P(R("Live ") + Field("PAGE", "77")) + Table(P(R("Table ") + Field("PAGE", "88") + R(" of ") + Field("NUMPAGES", "99"))) + P(""));
         docx.Paragraph(Body());
         docx.SectionProperties = Reference(first, "first") + DefaultPage + TitlePage;
 
-        var words = (await PagesAsync(docx))[0].Words.Select(w => w.Text).ToList();
+        var pages = await PagesAsync(docx);
 
-        Assert.DoesNotContain("77", words);
-        Assert.Contains("1", words);
-        Assert.Contains("88", words);
-        Assert.Contains("99", words);
+        Assert.Equal(2, pages.Count);
+        Assert.Contains("Live1", pages[0].Text);
+        Assert.Contains("Table1of2", pages[0].Text);
+        Assert.DoesNotContain("Table", pages[1].Text);
+    }
+
+    [Fact]
+    public async Task Page_fields_in_a_later_first_page_header_follow_its_page_number_and_section_length()
+    {
+        var docx = new DocxBuilder();
+        var first = docx.Header(Table(P(R("Table ") + Field("PAGE", "88") + R(" of ") + Field("SECTIONPAGES", "99") + R(" in ") + Field("NUMPAGES", "77"))));
+        docx.Paragraph(P(R("Cover"), $"<w:sectPr>{DefaultPage}</w:sectPr>") + Body());
+        docx.SectionProperties = Reference(first, "first") + DefaultPage + "<w:pgNumType w:start=\"7\"/>" + TitlePage;
+
+        var pages = await PagesAsync(docx);
+
+        Assert.Equal(3, pages.Count);
+        Assert.Contains("Table7of2in3", pages[1].Text);
     }
 
     [Fact]

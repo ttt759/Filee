@@ -417,7 +417,7 @@ internal static class OmmlReader
         var separator = Character("sepChr", "|");
         var parts = d.Elements(M + "e").ToList();
 
-        // A matrix in brackets is a pmatrix / bmatrix / dmatrix; a brace before an equation array is cases.
+        // A matrix in brackets is a pmatrix / bmatrix / dmatrix. A one-sided brace can also enclose an equation array.
         if (parts.Count == 1 && Arguments(parts[0]) is [var only])
         {
             var style = (open, close) switch
@@ -455,8 +455,8 @@ internal static class OmmlReader
     private static MathMatrix Matrix(XElement m, string command) =>
         new(command, m.Elements(M + "mr").Select(row => (IReadOnlyList<MathNode>)row.Elements(M + "e").Select(e => (MathNode)Content(e, roman: false)).ToList()).ToList());
 
-    /// <summary>Cases: each line of the equation array split into cells at its alignment marks.</summary>
-    private static MathCases Cases(XElement eqArr)
+    /// <summary>Center unmarked rows inside the brace, or keep their case columns when alignment marks split them.</summary>
+    private static MathNode Cases(XElement eqArr)
     {
         var rows = new List<IReadOnlyList<MathNode>>();
         foreach (var line in eqArr.Elements(M + "e"))
@@ -478,6 +478,8 @@ internal static class OmmlReader
             cells.Add(new MathRow(cell));
             rows.Add(cells);
         }
+        if (rows.Count > 0 && rows.All(r => r.Count == 1))
+            return new MathBrackets("{", "", new MathPile(rows.Select(r => r[0]).ToList()));
         return new MathCases(rows);
     }
 
